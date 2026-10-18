@@ -16,7 +16,7 @@ import math
 import os
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -32,6 +32,7 @@ SCANS_DIR = os.path.join(HERE, "scans")
 # Hosted (e.g. Streamlit Community Cloud): visitors share one server, so nothing is written to disk.
 HOSTED = os.environ.get("SWING_HOSTED") == "1" or HERE.startswith("/mount/src")
 ET_TZ = ZoneInfo("America/New_York")
+SG_TZ = ZoneInfo("Asia/Singapore")
 MIN_RR = 2.0  # strategy floor: never plan below 1:2
 PREMARKET_GAP = -3.0  # premarket move (%) that counts as an overnight shock
 FG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -90,6 +91,32 @@ def market_session(now: datetime | None = None) -> str:
     if t < 20 * 60:
         return "after hours"
     return "closed"
+
+
+def next_session_event(now: datetime | None = None) -> tuple[str, datetime]:
+    """What changes next and when: premarket 4:00, open 9:30, close 16:00, after-hours end 20:00
+    (New York time). Weekends skip to Monday premarket. Exchange holidays are not handled."""
+    n = (now or datetime.now(timezone.utc)).astimezone(ET_TZ)
+
+    def at(d, h, m):
+        return datetime(d.year, d.month, d.day, h, m, tzinfo=ET_TZ)
+
+    t = n.hour * 60 + n.minute
+    if n.weekday() < 5:
+        for end, label, h, m in [(240, "Premarket opens", 4, 0), (570, "Market opens", 9, 30),
+                                 (960, "Market closes", 16, 0), (1200, "After-hours closes", 20, 0)]:
+            if t < end:
+                return label, at(n, h, m)
+    d = n.date() + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return "Premarket opens", at(d, 4, 0)
+
+
+def countdown(target: datetime, now: datetime | None = None) -> str:
+    mins = max(0, int((target - (now or datetime.now(timezone.utc))).total_seconds() // 60))
+    d, h, m = mins // 1440, mins % 1440 // 60, mins % 60
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
 
 
 def _base_filters(p: dict) -> list:
@@ -269,6 +296,8 @@ header[data-testid="stHeader"] { background: transparent; }
 .sw-pill.live { border-color: rgba(43,217,160,.5); color: var(--green); }
 .sw-pill.pre  { border-color: rgba(255,181,71,.5); color: var(--amber); }
 .sw-pill.off  { border-color: rgba(255,92,122,.4); color: #FF9AAE; }
+.sw-pill.cd   { background: rgba(139,108,255,.16); border-color: rgba(139,108,255,.55); }
+.sw-pill.cd b { font-weight: 800; }
 
 .sw-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 6px 0 22px; }
 .sw-stat { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; }
@@ -422,6 +451,18 @@ TIP_JS = """<script>
     tip.style.top = top + "px";
     tip.style.setProperty("--ay", (cy - top) + "px");
   });
+  const fmt = (ms) => {
+    const m = Math.max(0, Math.floor(ms / 60000)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
+    return ms <= 0 ? "now, refresh" : d ? d + "d " + h + "h" : h ? h + "h " + (m % 60) + "m" : (m % 60) + "m";
+  };
+  const tick = () => {
+    doc.querySelectorAll(".sw-cd").forEach((e) => { e.textContent = fmt(+e.dataset.until - Date.now()); });
+    doc.querySelectorAll(".sw-clock").forEach((e) => {
+      e.textContent = new Intl.DateTimeFormat("en-GB", { timeZone: e.dataset.tz, weekday: "short",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date()).replace(",", "");
+    });
+  };
+  window.parent.setInterval(tick, 15000);
   doc.addEventListener("mouseout", (e) => {
     const q = e.target.closest && e.target.closest(".sw-q");
     if (q && tip) tip.style.display = "none";
@@ -681,6 +722,7 @@ def fear_greed_html() -> str:
 
 def hero(session: str):
     now_et = datetime.now(ET_TZ)
+    label, target = next_session_event()
     cls, emoji = {"open": ("live", "🟢"), "premarket": ("pre", "🌅"),
                   "after hours": ("pre", "🌙")}.get(session, ("off", "🔴"))
     st.markdown(f"""
@@ -689,7 +731,9 @@ def hero(session: str):
   <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
   <div class="sw-pills">
     <span class="sw-pill {cls}">{emoji} Market {session}</span>
-    <span class="sw-pill">🗽 New York {now_et:%a %H:%M}</span>
+    <span class="sw-pill cd">⏳ {label} in <b class="sw-cd" data-until="{int(target.timestamp() * 1000)}">{countdown(target)}</b></span>
+    <span class="sw-pill">🗽 New York <span class="sw-clock" data-tz="America/New_York">{now_et:%a %H:%M}</span></span>
+    <span class="sw-pill">🇸🇬 Singapore <span class="sw-clock" data-tz="Asia/Singapore">{now_et.astimezone(SG_TZ):%a %H:%M}</span></span>
     <span class="sw-pill">⏱️ ~15 min delayed</span>
     <span class="sw-pill">🎯 Lower band · RSI · volume · news</span>
   </div></div>
@@ -716,7 +760,7 @@ def main():
     with c1:
         if session.startswith("closed") or session == "after hours":
             st.caption("😴 Market is closed, so this is the last close. Best times to scan: premarket "
-                       "(from 4:00 New York) for overnight shocks, and right after the open.")
+                       "for overnight shocks, and right after the open.")
         else:
             st.caption("⚡ Market is live. Prices refresh each time you scan.")
     run = c2.button("🔍 Scan the market", type="primary", width="stretch")
