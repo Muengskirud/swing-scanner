@@ -322,6 +322,8 @@ header[data-testid="stHeader"] { background: transparent; }
 .sw-stat .n { font-size: 1.7rem; font-weight: 800; color: var(--text); line-height: 1.1; }
 .sw-stat .l { font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
 
+.sw-rule { font-size: 1.05rem; font-weight: 500; color: var(--muted); padding-top: 8px; }
+.sw-rule b { color: var(--text); font-weight: 800; }
 .sw-section { font-size: 1.05rem; font-weight: 700; color: var(--text); margin: 8px 0 10px; }
 
 .sw-card { background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 20px;
@@ -795,12 +797,7 @@ def results(p: dict, session: str) -> list:
     """Scan button, stats and candidate cards. Returns (ticker, day change %) for the
     'worth a look' names so the ticker tape can show them."""
     c1, c2 = st.columns([2, 1])
-    with c1:
-        if session.startswith("closed") or session == "after hours":
-            st.caption("😴 Market is closed, so this is the last close. Best times to scan: premarket "
-                       "for overnight shocks, and right after the open.")
-        else:
-            st.caption("⚡ Market is live. Prices refresh each time you scan.")
+    c1.markdown('<div class="sw sw-rule">Rule: <b>Don&#39;t be greedy</b></div>', unsafe_allow_html=True)
     run = c2.button("🔍 Scan the market", type="primary", width="stretch")
     if run:
         with st.spinner("Scanning the market for panic sells..."):
