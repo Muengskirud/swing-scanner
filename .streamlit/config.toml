@@ -1,0 +1,16 @@
+[theme]
+base = "dark"
+primaryColor = "#8B6CFF"
+backgroundColor = "#0B0F1A"
+secondaryBackgroundColor = "#141B2D"
+textColor = "#E8EBF5"
+font = "Montserrat:https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap"
+baseRadius = "12px"
+borderColor = "#232C45"
+
+[theme.sidebar]
+backgroundColor = "#0E1322"
+secondaryBackgroundColor = "#141B2D"
+
+[client]
+toolbarMode = "minimal"
