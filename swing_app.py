@@ -44,7 +44,7 @@ COLUMNS = [
     "SMA200", "Perf.W", "premarket_close", "premarket_change", "update_mode",
 ]
 DEFAULTS = {
-    "max_risk": 35, "rr": 2.0, "stop_mode": "ATR", "atr_mult": 1.5,
+    "layman": True, "max_risk": 35, "rr": 2.0, "stop_mode": "ATR", "atr_mult": 1.5,
     "target_pct": 4.0, "max_hold": 7,
     "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_min": 20, "rsi_max": 35,
     "min_rel_vol": 1.5, "bb_tol": 1.01, "earn_buffer": 7,
@@ -384,6 +384,9 @@ div[data-testid="stTooltipContent"] p { font-family: 'Montserrat', sans-serif !i
 div[data-testid="stElementContainer"]:has(iframe[height="0"]) { display: none; }
 .sw-float::before { content: ""; position: absolute; left: -15px; top: var(--ay, 24px); margin-top: -7px;
   border: 7px solid transparent; border-right-color: rgba(139,108,255,.75); }
+.st-key-layman { opacity: .6; transition: opacity .15s; }
+.st-key-layman:hover { opacity: 1; }
+.st-key-layman label p { font-size: .75rem !important; font-weight: 600; }
 .sw-tkr a { color: var(--text) !important; text-decoration: none; }
 .sw-tkr a:hover { color: var(--violet) !important; }
 .sw-tkr a span { font-size: .8rem; color: var(--muted); margin-left: 4px; }
@@ -439,8 +442,16 @@ def field(where, kind: str, label: str, *args, help: str = "", **kw):
 def sidebar() -> dict:
     s = load_settings()
     sb = st.sidebar
-    sb.markdown("### ⚙️ Your rules")
     p = {}
+    head, sw = sb.columns([3, 2], vertical_alignment="center")
+    head.markdown("### ⚙️ Your rules")
+    p["layman"] = sw.toggle("Layman", value=bool(s["layman"]), key="layman")
+    if not p["layman"]:  # hide every hover explanation across the app
+        st.markdown("""<style>
+[data-tip]:hover::after, [data-tip]:hover::before { display: none !important; }
+[data-tip] { cursor: inherit !important; }
+.sw-q, .sw-float { display: none !important; }
+</style>""", unsafe_allow_html=True)
     p["max_risk"] = field(sb, "number_input", 
         "💸 Max loss per trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0,
         help="The most you're willing to lose if the stop is hit. The app works out how many shares "
@@ -589,7 +600,7 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     return f"""
 <div class="sw sw-card {'skip' if failed else ''}">
   <div class="sw-top">
-    <div><div class="sw-tkr"><a href="{tv_url(row)}" target="_blank" title="Open the chart on TradingView">{esc(row['name'])}<span>↗</span></a></div>
+    <div><div class="sw-tkr"><a href="{tv_url(row)}" target="_blank">{esc(row['name'])}<span>↗</span></a></div>
          <div class="sw-co">{esc(str(row['description']))}</div>
          <div class="sw-co">🏭 {esc(str(row['sector']))} › {esc(str(row['industry']))}</div></div>
     {chip}
