@@ -114,9 +114,9 @@ def next_session_event(now: datetime | None = None) -> tuple[str, datetime]:
 
 
 def countdown(target: datetime, now: datetime | None = None) -> str:
-    mins = max(0, int((target - (now or datetime.now(timezone.utc))).total_seconds() // 60))
-    d, h, m = mins // 1440, mins % 1440 // 60, mins % 60
-    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
+    secs = max(0, int((target - (now or datetime.now(timezone.utc))).total_seconds()))
+    d, h, m, sec = secs // 86400, secs % 86400 // 3600, secs % 3600 // 60, secs % 60
+    return f"{d}d {h}h {m:02d}m" if d else f"{h}h {m:02d}m {sec:02d}s" if h else f"{m}m {sec:02d}s"
 
 
 def _base_filters(p: dict) -> list:
@@ -299,21 +299,20 @@ header[data-testid="stHeader"] { background: transparent; }
 /* ticker tape */
 .sw-tape { grid-column: 1 / -1; display: flex; align-items: stretch; margin-top: 4px; height: 40px;
   border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: rgba(5,8,16,.55); }
-.sw-status { display: flex; align-items: center; gap: 8px; padding: 0 14px; flex: none; white-space: nowrap;
-  font-size: .72rem; font-weight: 800; text-transform: uppercase; letter-spacing: .8px;
-  border-right: 1px solid var(--line); background: rgba(255,255,255,.04); }
+.sw-status { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+  font-size: .74rem; font-weight: 800; text-transform: uppercase; letter-spacing: .8px; }
 .sw-status i { width: 7px; height: 7px; border-radius: 50%; background: currentColor;
   box-shadow: 0 0 10px currentColor; animation: swblink 1.6s ease-in-out infinite; }
 .sw-status.live { color: var(--green); } .sw-status.pre { color: var(--amber); } .sw-status.off { color: #FF7A93; }
 .sw-roll { position: relative; flex: 1; overflow: hidden;
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
-          mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent); }
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 4%, #000 96%, transparent);
+          mask-image: linear-gradient(90deg, transparent, #000 4%, #000 96%, transparent); }
 .sw-track { display: inline-flex; align-items: center; height: 100%; white-space: nowrap;
   animation: swroll 40s linear infinite; }
 .sw-tape:hover .sw-track { animation-play-state: paused; }
 .sw-tick { display: inline-flex; align-items: center; gap: 6px; padding: 0 22px; font-size: .82rem;
   font-weight: 600; color: var(--muted); }
-.sw-tick b { color: var(--text); font-weight: 800; }
+.sw-tick b { color: var(--text); font-weight: 800; font-variant-numeric: tabular-nums; }
 .sw-tick::after { content: "◆"; margin-left: 44px; font-size: .5rem; color: var(--violet); opacity: .8; }
 @keyframes swroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 @keyframes swblink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
@@ -470,18 +469,21 @@ TIP_JS = """<script>
     tip.style.top = top + "px";
     tip.style.setProperty("--ay", (cy - top) + "px");
   });
+  const p2 = (n) => String(n).padStart(2, "0");
   const fmt = (ms) => {
-    const m = Math.max(0, Math.floor(ms / 60000)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
-    return ms <= 0 ? "now, refresh" : d ? d + "d " + h + "h" : h ? h + "h " + (m % 60) + "m" : (m % 60) + "m";
+    if (ms <= 0) return "now, refresh";
+    const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+          m = Math.floor(s % 3600 / 60), sec = s % 60;
+    return d ? d + "d " + h + "h " + p2(m) + "m" : h ? h + "h " + p2(m) + "m " + p2(sec) + "s" : m + "m " + p2(sec) + "s";
   };
   const tick = () => {
     doc.querySelectorAll(".sw-cd").forEach((e) => { e.textContent = fmt(+e.dataset.until - Date.now()); });
     doc.querySelectorAll(".sw-clock").forEach((e) => {
       e.textContent = new Intl.DateTimeFormat("en-GB", { timeZone: e.dataset.tz, weekday: "short",
-        hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date()).replace(",", "");
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(new Date()).replace(",", "");
     });
   };
-  window.parent.setInterval(tick, 15000);
+  window.parent.setInterval(tick, 1000);
   doc.addEventListener("mouseout", (e) => {
     const q = e.target.closest && e.target.closest(".sw-q");
     if (q && tip) tip.style.display = "none";
@@ -739,27 +741,34 @@ def fear_greed_html() -> str:
 </div>"""
 
 
-def hero(session: str):
+def hero_html(session: str, picks: list) -> str:
     now_et = datetime.now(ET_TZ)
     label, target = next_session_event()
     cls = {"open": "live", "premarket": "pre", "after hours": "pre"}.get(session, "off")
-    items = "".join(f'<span class="sw-tick">{x}</span>' for x in [
+    ticks = [
+        f'<span class="sw-status {cls}"><i></i>Market {session}</span>',
         f'⏳ {label} in <b class="sw-cd" data-until="{int(target.timestamp() * 1000)}">{countdown(target)}</b>',
-        f'🗽 New York <b class="sw-clock" data-tz="America/New_York">{now_et:%a %H:%M}</b>',
-        f'🇸🇬 Singapore <b class="sw-clock" data-tz="Asia/Singapore">{now_et.astimezone(SG_TZ):%a %H:%M}</b>',
-        '🎯 Lower band <b>·</b> RSI <b>·</b> volume <b>·</b> news',
-    ])
-    st.markdown(f"""
+        f'🗽 New York <b class="sw-clock" data-tz="America/New_York">{now_et:%a %H:%M:%S}</b>',
+        f'🇸🇬 Singapore <b class="sw-clock" data-tz="Asia/Singapore">{now_et.astimezone(SG_TZ):%a %H:%M:%S}</b>',
+    ]
+    if picks:
+        ticks.append('✨ <b>Worth a look</b>')
+        ticks += [f'<b>{html.escape(t)}</b> <span class="{"red" if c < 0 else "green"}">'
+                  f'{"▼" if c < 0 else "▲"} {abs(c):.1f}%</span>' for t, c in picks]
+    else:
+        ticks.append('🎯 Lower band <b>·</b> RSI <b>·</b> volume <b>·</b> news')
+    items = "".join(f'<span class="sw-tick">{x}</span>' for x in ticks)
+    reps = max(2, -(-8 // len(ticks)))  # each half of the loop must be wider than the strip
+    return f"""
 <div class="sw sw-hero"><div>
   <h1>📉 SkimTrade</h1>
   <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
   </div>
   {fear_greed_html()}
   <div class="sw-tape">
-    <span class="sw-status {cls}"><i></i>Market {session}</span>
-    <div class="sw-roll"><div class="sw-track">{items * 2}{items * 2}</div></div>
+    <div class="sw-roll"><div class="sw-track" style="animation-duration:{len(ticks) * reps * 3.5:.0f}s">{items * reps}{items * reps}</div></div>
   </div>
-</div>""", unsafe_allow_html=True)
+</div>"""
 
 
 def stats_html(items: list) -> str:
@@ -775,8 +784,17 @@ def main():
     components.html(TIP_JS, height=0)
     p = sidebar()
     session = market_session()
-    hero(session)
+    hero_slot = st.empty()  # drawn now with the last picks, redrawn once this run's scan is known
+    hero_slot.markdown(hero_html(session, st.session_state.get("picks", [])), unsafe_allow_html=True)
+    picks = results(p, session)
+    if picks != st.session_state.get("picks", []):
+        st.session_state["picks"] = picks
+        hero_slot.markdown(hero_html(session, picks), unsafe_allow_html=True)
 
+
+def results(p: dict, session: str) -> list:
+    """Scan button, stats and candidate cards. Returns (ticker, day change %) for the
+    'worth a look' names so the ticker tape can show them."""
     c1, c2 = st.columns([2, 1])
     with c1:
         if session.startswith("closed") or session == "after hours":
@@ -801,13 +819,13 @@ def main():
                                 ("💸", f"${p['max_risk']:g} max loss", ""),
                                 ("⏳", f"{p['max_hold']} day max hold", "")]),
                     unsafe_allow_html=True)
-        return
+        return []
 
     raw = st.session_state["raw"].copy()
     sess = st.session_state["session"]
     if raw.empty:
         st.success("😌 Nothing is oversold on heavy volume. No setup means no trade.")
-        return
+        return []
     raw["ref"] = [ref_price(r, sess) for _, r in raw.iterrows()]
     near = raw[(raw["ref"] <= raw["BB.lower"] * p["bb_tol"]) | (raw["source"] == "premarket gap")]
     near = near.sort_values(["RSI", "relative_volume_10d_calc"], ascending=[True, False]).head(16)
@@ -828,7 +846,7 @@ def main():
 
     if not evs:
         st.warning("Some stocks are oversold, but none are at the lower Bollinger Band. No trade today. 🧘")
-        return
+        return []
     if good:
         st.markdown('<div class="sw sw-section">✨ Worth a look</div>', unsafe_allow_html=True)
         cols = st.columns(2, gap="medium")
@@ -841,6 +859,7 @@ def main():
             for i, e in enumerate(skip):
                 with cols[i % 2]:
                     render_candidate(e, p, sess)
+    return [(str(e["row"]["name"]), float(e["row"]["change"])) for e in good]
 
 
 if __name__ == "__main__":
