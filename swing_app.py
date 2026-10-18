@@ -341,6 +341,33 @@ section[data-testid="stSidebar"] { background: #0E1322; border-right: 1px solid 
                 border-radius: 3px; box-shadow: 0 0 8px rgba(255,255,255,.8); }
 .sw-fg .m { font-size: .72rem; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
 .sw-fg a { color: var(--violet) !important; text-decoration: none; font-weight: 700; }
+/* hover bubbles */
+[data-tip] { position: relative; cursor: help; }
+[data-tip]:hover::after {
+  content: attr(data-tip); position: absolute; z-index: 1000; left: 50%; bottom: calc(100% + 12px);
+  transform: translateX(-50%); width: 240px; min-height: 150px; box-sizing: border-box;
+  display: flex; align-items: center; padding: 16px 18px; border-radius: 18px;
+  background: linear-gradient(160deg, #241C4A 0%, #182036 70%); border: 1px solid rgba(139,108,255,.55);
+  box-shadow: 0 18px 40px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.03);
+  color: var(--text); font-family: 'Montserrat', sans-serif; font-size: .78rem; font-weight: 500;
+  line-height: 1.5; letter-spacing: 0; text-transform: none; white-space: normal; text-align: left;
+  pointer-events: none; animation: swpop .15s ease-out; }
+[data-tip]:hover::before {
+  content: ""; position: absolute; z-index: 1001; left: 50%; bottom: calc(100% + 5px); transform: translateX(-50%);
+  border: 7px solid transparent; border-top-color: rgba(139,108,255,.55); pointer-events: none; }
+.sw-fg[data-tip]:hover::after { bottom: auto; top: calc(100% + 12px); left: auto; right: 0; transform: none; }
+.sw-fg[data-tip]:hover::before { bottom: auto; top: calc(100% - 2px); left: auto; right: 40px; transform: none;
+  border-top-color: transparent; border-bottom-color: rgba(139,108,255,.55); }
+@keyframes swpop { from { opacity: 0; } to { opacity: 1; } }
+.sw-card { position: relative; } .sw-card:hover { z-index: 20; }
+.sw-hero { position: relative; z-index: 30; } .sw-stats { position: relative; z-index: 25; }
+/* Streamlit's own (?) help bubbles in the sidebar */
+div[data-testid="stTooltipContent"], div[data-baseweb="tooltip"] > div {
+  max-width: 260px !important; border-radius: 18px !important; padding: 16px 18px !important;
+  background: linear-gradient(160deg, #241C4A 0%, #182036 70%) !important;
+  border: 1px solid rgba(139,108,255,.55) !important; box-shadow: 0 18px 40px rgba(0,0,0,.55) !important; }
+div[data-testid="stTooltipContent"] p { font-family: 'Montserrat', sans-serif !important; font-size: .8rem !important;
+  line-height: 1.5 !important; color: var(--text) !important; }
 .sw-tkr a { color: var(--text) !important; text-decoration: none; }
 .sw-tkr a:hover { color: var(--violet) !important; }
 .sw-tkr a span { font-size: .8rem; color: var(--muted); margin-left: 4px; }
@@ -464,13 +491,13 @@ def chart_widget(row) -> str:
 
 
 TIPS = {
-    "day": "How much the price moved in the latest session.",
+    "day": "How much the price moved in the latest trading session. A big red number after bad news is the kind of shock this setup looks for.",
     "rsi": "RSI 0-100: how hard it's been sold lately. Under 30 = oversold. Under 15-20 = possible falling knife.",
     "vol": "Volume vs a normal day. 2x = twice the usual shares traded: a sign of panic selling.",
-    "week": "Price change over the last 5 trading days.",
+    "week": "Price change over the last 5 trading days. A deep weekly drop means the selling has been going on for a while, not just one bad day.",
     "entry": "Suggested buy price (latest price, ~15 min delayed). 'max' = above this it's no longer at the lower band, so don't chase.",
-    "stop": "Sell here to cap the loss at your max loss.",
-    "target": "Take-profit price, set by your reward:risk.",
+    "stop": "If the price falls to here, you sell. This caps the loss at about your max loss. Never move it lower once you're in.",
+    "target": "Take-profit price. It sits reward:risk times further above your entry than the stop sits below it (2x for 1:2).",
 }
 
 
@@ -514,18 +541,18 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     {chip}
   </div>
   <div class="sw-mini">
-    <div title="{TIPS['day']}"><div class="k">Day</div><div class="v red">{row['change']:+.1f}%</div></div>
-    <div title="{TIPS['rsi']}"><div class="k">RSI</div><div class="v">{rsi:.0f}</div>
+    <div data-tip="{TIPS['day']}"><div class="k">Day</div><div class="v red">{row['change']:+.1f}%</div></div>
+    <div data-tip="{TIPS['rsi']}"><div class="k">RSI</div><div class="v">{rsi:.0f}</div>
          <div class="sw-meter"><span style="width:{min(rsi, 100):.0f}%;background:{rsi_col}"></span></div></div>
-    <div title="{TIPS['vol']}"><div class="k">Vol</div><div class="v {'green' if vol >= p['min_rel_vol'] else ''}">{vol:.1f}x</div></div>
-    <div title="{TIPS['week']}"><div class="k">Week</div><div class="v {'red' if not pd.isna(week) and week < 0 else ''}">{week_txt}</div></div>
+    <div data-tip="{TIPS['vol']}"><div class="k">Vol</div><div class="v {'green' if vol >= p['min_rel_vol'] else ''}">{vol:.1f}x</div></div>
+    <div data-tip="{TIPS['week']}"><div class="k">Week</div><div class="v {'red' if not pd.isna(week) and week < 0 else ''}">{week_txt}</div></div>
   </div>
   <div class="sw-plan">
-    <div class="e" title="{TIPS['entry']}"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
+    <div class="e" data-tip="{TIPS['entry']}"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
          <div class="d" style="color:var(--muted)">max {money(bb_line)}</div></div>
-    <div class="s" title="{TIPS['stop']}"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
+    <div class="s" data-tip="{TIPS['stop']}"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
          <div class="d red">-{plan['stop_pct']:.1f}%</div></div>
-    <div class="t" title="{TIPS['target']}"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
+    <div class="t" data-tip="{TIPS['target']}"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
          <div class="d green">+{plan['target_pct']:.1f}%</div></div>
   </div>
   <div class="sw-ladder" style="--cut:{cut:.1f}%"><i></i></div>
@@ -572,13 +599,13 @@ FG_TIP = ("CNN Fear & Greed Index: the mood of the US stock market from 7 signal
 def fear_greed_html() -> str:
     fg = fetch_fear_greed()
     if fg is None:
-        return (f'<a class="sw-fg" href="{FG_PAGE}" target="_blank" title="{FG_TIP}" style="display:block">'
+        return (f'<a class="sw-fg" href="{FG_PAGE}" target="_blank" data-tip="{FG_TIP}" style="display:block">'
                 '<div class="k">😨 Fear &amp; Greed</div><div class="r" style="color:var(--muted)">'
                 'Unavailable right now</div><div class="m"><span>Source: CNN ↗</span></div></a>')
     c = FG_COLORS.get(fg["rating"], "#FFC94D")
     prev = f"prev {fg['prev']:.0f}" if fg["prev"] is not None else ""
     week = f"1w ago {fg['week']:.0f}" if fg["week"] is not None else ""
-    return f"""<div class="sw-fg" title="{FG_TIP}">
+    return f"""<div class="sw-fg" data-tip="{FG_TIP}">
   <div class="k">😨 Fear &amp; Greed index</div>
   <div class="n" style="color:{c}">{fg['score']:.0f}</div>
   <div class="r" style="color:{c}">{html.escape(fg['rating'])}</div>
@@ -607,7 +634,8 @@ def hero(session: str):
 
 def stats_html(items: list) -> str:
     return ('<div class="sw sw-stats">' + "".join(
-        f'<div class="sw-stat" title="{html.escape(tip)}"><div class="n">{n}</div><div class="l">{l}</div></div>'
+        '<div class="sw-stat"' + (f' data-tip="{html.escape(tip)}"' if tip else "") +
+        f'><div class="n">{n}</div><div class="l">{l}</div></div>'
         for n, l, tip in items) + "</div>")
 
 
@@ -638,9 +666,9 @@ def main():
 
     if "raw" not in st.session_state:
         st.markdown(stats_html([("👆", "Press scan to start", ""),
-                                ("🎯", "1:" + f"{p['rr']:g}" + " reward:risk", "Change in the sidebar."),
-                                ("💸", f"${p['max_risk']:g} max loss", "Change in the sidebar."),
-                                ("⏳", f"{p['max_hold']} day max hold", "Change in the sidebar.")]),
+                                ("🎯", "1:" + f"{p['rr']:g}" + " reward:risk", ""),
+                                ("💸", f"${p['max_risk']:g} max loss", ""),
+                                ("⏳", f"{p['max_hold']} day max hold", "")]),
                     unsafe_allow_html=True)
         return
 
