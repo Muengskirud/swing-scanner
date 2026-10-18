@@ -1,5 +1,5 @@
 """
-Swing Scanner (Streamlit). A research screener for oversold rebounds after emotional
+SkimTrade (Streamlit). A research screener for oversold rebounds after emotional
 sell-offs: finds US stocks at the lower Bollinger Band with low RSI and heavy volume,
 builds a trade plan from a fixed dollar risk and reward:risk (minimum 1:2), and shows
 the headlines behind each drop.
@@ -455,7 +455,7 @@ def hero(session: str):
                   "after hours": ("pre", "🌙")}.get(session, ("off", "🔴"))
     st.markdown(f"""
 <div class="sw sw-hero">
-  <h1>📉 Swing Scanner</h1>
+  <h1>📉 SkimTrade</h1>
   <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
   <div class="sw-pills">
     <span class="sw-pill {cls}">{emoji} Market {session}</span>
@@ -473,7 +473,7 @@ def stats_html(items: list) -> str:
 
 
 def main():
-    st.set_page_config(page_title="Swing Scanner", page_icon="📉", layout="wide")
+    st.set_page_config(page_title="SkimTrade", page_icon="📉", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     p = sidebar()
     session = market_session()

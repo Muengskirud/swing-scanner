@@ -1,4 +1,4 @@
-# 📉 Swing Scanner
+# 📉 SkimTrade
 
 A research screener for oversold rebounds after emotional sell-offs. It finds US stocks that dropped sharply on heavy volume and sit at or below the lower Bollinger Band with a low RSI. For each one it builds a trade plan (entry, stop, target, shares) from your max dollar loss and reward:risk (minimum 1:2) and shows the headlines behind the drop.
 
