@@ -336,7 +336,7 @@ section[data-testid="stSidebar"] { background: #0E1322; border-right: 1px solid 
 .sw-fg .n { font-size: 2.4rem; font-weight: 800; line-height: 1.05; margin-top: 4px; }
 .sw-fg .r { font-size: .85rem; font-weight: 700; text-transform: capitalize; }
 .sw-fg .bar { position: relative; height: 8px; border-radius: 9px; margin: 12px 0 8px;
-              background: linear-gradient(90deg, #B3243B 0 25%, #FF5C7A 25% 45%, #FFC94D 45% 55%, #8EE6A8 55% 75%, #2BD9A0 75% 100%); }
+              background: linear-gradient(90deg, #2BD9A0 0 25%, #8EE6A8 25% 45%, #FFC94D 45% 55%, #FF5C7A 55% 75%, #B3243B 75% 100%); }
 .sw-fg .bar i { position: absolute; top: -4px; width: 4px; height: 16px; margin-left: -2px; background: #fff;
                 border-radius: 3px; box-shadow: 0 0 8px rgba(255,255,255,.8); }
 .sw-fg .m { font-size: .72rem; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
@@ -559,11 +559,14 @@ def render_candidate(ev: dict, p: dict, session: str):
                             for label, _, ok in ev["cks"]), unsafe_allow_html=True)
 
 
-FG_COLORS = {"extreme fear": "#B3243B", "fear": "#FF5C7A", "neutral": "#FFC94D",
-             "greed": "#8EE6A8", "extreme greed": "#2BD9A0"}
+# Coloured for a buy-the-panic trader: fear = opportunity (green), greed = be careful (red).
+FG_COLORS = {"extreme fear": "#2BD9A0", "fear": "#8EE6A8", "neutral": "#FFC94D",
+             "greed": "#FF5C7A", "extreme greed": "#B3243B"}
 FG_TIP = ("CNN Fear & Greed Index: the mood of the US stock market from 7 signals (momentum, volatility, "
           "safe-haven demand and more). 0 = extreme fear (people panic-selling), 100 = extreme greed. "
-          "Fear is when buy-the-panic setups show up, but fear can last a while. Click to open CNN.")
+          "Green (fear) = panic selling, when buy-the-panic setups tend to appear. It is not a buy signal by itself: "
+          "fear can last weeks, so each trade still has to pass your rules. Red (greed) = market is "
+          "euphoric, be extra careful. Click to open CNN.")
 
 
 def fear_greed_html() -> str:
