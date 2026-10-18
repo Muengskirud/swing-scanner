@@ -322,6 +322,7 @@ header[data-testid="stHeader"] { background: transparent; }
 .sw-stat .n { font-size: 1.7rem; font-weight: 800; color: var(--text); line-height: 1.1; }
 .sw-stat .l { font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
 
+.sw-bless { font-size: .8rem; font-weight: 600; color: var(--muted); letter-spacing: .3px; margin-bottom: 6px; }
 .sw-rule { font-size: 1.05rem; font-weight: 500; color: var(--muted); padding-top: 8px; }
 .sw-rule b { color: var(--text); font-weight: 800; }
 .sw-section { font-size: 1.05rem; font-weight: 700; color: var(--text); margin: 8px 0 10px; }
@@ -762,6 +763,7 @@ def hero_html(session: str, picks: list) -> str:
     reps = max(2, -(-8 // len(ticks)))  # each half of the loop must be wider than the strip
     return f"""
 <div class="sw sw-hero"><div>
+  <div class="sw-bless">May God bless this trade. Amen ✝️</div>
   <h1>📉 SkimTrade</h1>
   <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
   </div>
