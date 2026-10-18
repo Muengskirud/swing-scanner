@@ -45,7 +45,7 @@ COLUMNS = [
     "SMA200", "Perf.W", "premarket_close", "premarket_change", "update_mode",
 ]
 DEFAULTS = {
-    "layman": True, "max_risk": 35, "rr": 2.0, "stop_mode": "ATR", "atr_mult": 1.5,
+    "layman": False, "max_risk": 35, "rr": 2.0, "stop_mode": "ATR", "atr_mult": 1.5,
     "target_pct": 4.0, "max_hold": 7,
     "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_min": 20, "rsi_max": 35,
     "min_rel_vol": 1.5, "bb_tol": 1.01, "earn_buffer": 7,
