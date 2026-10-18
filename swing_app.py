@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from tradingview_screener import Query, col
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +33,9 @@ SCANS_DIR = os.path.join(HERE, "scans")
 HOSTED = os.environ.get("SWING_HOSTED") == "1" or HERE.startswith("/mount/src")
 ET_TZ = ZoneInfo("America/New_York")
 MIN_RR = 2.0  # strategy floor: never plan below 1:2
+PREMARKET_GAP = -3.0  # premarket move (%) that counts as an overnight shock
+FG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+FG_PAGE = "https://www.cnn.com/markets/fear-and-greed"
 
 COLUMNS = [
     "name", "description", "close", "change", "RSI", "BB.lower", "BB.upper", "ATR",
@@ -42,8 +46,8 @@ COLUMNS = [
 DEFAULTS = {
     "max_risk": 35, "rr": 2.0, "stop_mode": "ATR", "atr_mult": 1.5,
     "target_pct": 4.0, "max_hold": 7,
-    "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_max": 35,
-    "min_rel_vol": 1.5, "min_drop": -3.0, "bb_tol": 1.01, "earn_buffer": 7,
+    "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_min": 20, "rsi_max": 35,
+    "min_rel_vol": 1.5, "bb_tol": 1.01, "earn_buffer": 7,
 }
 
 SEVERE = re.compile(
@@ -98,13 +102,13 @@ def _base_filters(p: dict) -> list:
 
 
 def scan(p: dict) -> pd.DataFrame:
-    """Stocks that sold off with volume in the latest session (yesterday's session before the open)."""
+    """Oversold stocks trading on heavy volume in the latest session. The lower-band and
+    RSI-floor checks run afterwards so names that fail them can be shown with the reason."""
     q = (Query().set_markets("america").select(*COLUMNS)
          .where(*_base_filters(p),
                 col("RSI") < p["rsi_max"],
-                col("relative_volume_10d_calc") > p["min_rel_vol"],
-                col("change") < p["min_drop"])
-         .order_by("RSI", ascending=True).limit(200))
+                col("relative_volume_10d_calc") > p["min_rel_vol"])
+         .order_by("RSI", ascending=True).limit(500))
     _, df = q.get_scanner_data()
     df["source"] = "sell-off"
     return df
@@ -113,7 +117,7 @@ def scan(p: dict) -> pd.DataFrame:
 def scan_premarket_gaps(p: dict) -> pd.DataFrame:
     """Overnight shocks: names gapping down in premarket. Indicators are still from the last close."""
     q = (Query().set_markets("america").select(*COLUMNS)
-         .where(*_base_filters(p), col("premarket_change") < p["min_drop"])
+         .where(*_base_filters(p), col("premarket_change") < PREMARKET_GAP)
          .order_by("premarket_change", ascending=True).limit(50))
     _, df = q.get_scanner_data()
     df["source"] = "premarket gap"
@@ -176,8 +180,10 @@ def checks(row, plan, news, p) -> list:
         ("At or below lower Bollinger Band",
          f"price is {row['bb_dist_pct']:+.1f}% vs the lower band (limit ${bb_line:.2f})",
          plan["entry"] <= bb_line),
-        (f"RSI under {p['rsi_max']}", f"RSI {row['RSI']:.0f} is not under {p['rsi_max']}",
-         row["RSI"] < p["rsi_max"]),
+        (f"RSI between {p['rsi_min']} and {p['rsi_max']}",
+         (f"RSI {row['RSI']:.0f} is below {p['rsi_min']}: falling-knife zone, check the news hard"
+          if row["RSI"] < p["rsi_min"] else f"RSI {row['RSI']:.0f} is not under {p['rsi_max']}"),
+         p["rsi_min"] <= row["RSI"] < p["rsi_max"]),
         (f"Volume at least {p['min_rel_vol']}x average",
          f"volume only {row['relative_volume_10d_calc']:.1f}x average",
          row["relative_volume_10d_calc"] >= p["min_rel_vol"]),
@@ -219,6 +225,23 @@ def fetch_news(ticker: str, company: str, n: int = 6) -> list:
     except Exception as e:  # network or parse failure: say so, never fake it
         return [{"title": f"News unavailable ({type(e).__name__})", "link": "", "source": "",
                  "published": "", "level": "error"}]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fear_greed() -> dict | None:
+    """CNN Fear & Greed Index. CNN rejects requests that don't look like a browser."""
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+               "Accept": "application/json", "Referer": "https://www.cnn.com/", "Origin": "https://www.cnn.com"}
+    try:
+        r = requests.get(FG_URL, headers=headers, timeout=10)
+        r.raise_for_status()
+        fg = r.json()["fear_and_greed"]
+        return {"score": float(fg["score"]), "rating": str(fg["rating"]).lower(),
+                "prev": fg.get("previous_close"), "week": fg.get("previous_1_week"),
+                "asof": str(fg.get("timestamp", ""))[:10]}
+    except Exception:  # never fake it: the tile says unavailable and still links to CNN
+        return None
 
 
 # ---------------------------------------------------------------- styling
@@ -306,7 +329,23 @@ div.stButton > button[kind="primary"] { background: linear-gradient(90deg, var(-
     border: 0; border-radius: 14px; font-weight: 700; padding: .65rem 1rem; font-size: 1rem;
     box-shadow: 0 8px 30px rgba(139,108,255,.35); }
 section[data-testid="stSidebar"] { background: #0E1322; border-right: 1px solid var(--line); }
-@media (max-width: 760px) { .sw-stats, .sw-mini { grid-template-columns: repeat(2, 1fr); } }
+.sw-hero { display: grid; grid-template-columns: 1fr 270px; gap: 22px; align-items: center; }
+.sw-fg { background: rgba(11,15,26,.55); border: 1px solid var(--line); border-radius: 18px; padding: 16px 18px;
+         cursor: help; }
+.sw-fg .k { font-size: .7rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+.sw-fg .n { font-size: 2.4rem; font-weight: 800; line-height: 1.05; margin-top: 4px; }
+.sw-fg .r { font-size: .85rem; font-weight: 700; text-transform: capitalize; }
+.sw-fg .bar { position: relative; height: 8px; border-radius: 9px; margin: 12px 0 8px;
+              background: linear-gradient(90deg, #B3243B 0 25%, #FF5C7A 25% 45%, #FFC94D 45% 55%, #8EE6A8 55% 75%, #2BD9A0 75% 100%); }
+.sw-fg .bar i { position: absolute; top: -4px; width: 4px; height: 16px; margin-left: -2px; background: #fff;
+                border-radius: 3px; box-shadow: 0 0 8px rgba(255,255,255,.8); }
+.sw-fg .m { font-size: .72rem; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
+.sw-fg a { color: var(--violet) !important; text-decoration: none; font-weight: 700; }
+.sw-tkr a { color: var(--text) !important; text-decoration: none; }
+.sw-tkr a:hover { color: var(--violet) !important; }
+.sw-tkr a span { font-size: .8rem; color: var(--muted); margin-left: 4px; }
+@media (max-width: 760px) { .sw-stats, .sw-mini { grid-template-columns: repeat(2, 1fr); }
+                            .sw-hero { grid-template-columns: 1fr; } }
 </style>
 """
 
@@ -321,30 +360,62 @@ def sidebar() -> dict:
     sb = st.sidebar
     sb.markdown("### ⚙️ Your rules")
     p = {}
-    p["max_risk"] = sb.number_input("💸 Max loss per trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0,
-                                    help="Shares = max loss / (entry - stop).")
-    p["rr"] = sb.number_input("🎯 Reward : risk (1 : x)", MIN_RR, 10.0, max(float(s["rr"]), MIN_RR), 0.5,
-                              help="1:2 is the minimum.")
-    p["stop_mode"] = sb.radio("🛑 Stop based on", ["ATR", "Target %"],
-                              index=["ATR", "Target %"].index(s["stop_mode"]), horizontal=True,
-                              help="ATR: stop follows the stock's normal daily move. "
-                                   "Target %: you pick the rebound, the stop follows from reward:risk.")
+    p["max_risk"] = sb.number_input(
+        "💸 Max loss per trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0,
+        help="The most you're willing to lose if the stop is hit. The app works out how many shares "
+             "to buy so that hitting the stop costs about this much. Shares = max loss ÷ (entry − stop).")
+    p["rr"] = sb.number_input(
+        "🎯 Reward : risk (1 : x)", MIN_RR, 10.0, max(float(s["rr"]), MIN_RR), 0.5,
+        help="How much you aim to make for every $1 you risk. 1:2 means risk $35 to make $70. "
+             "1:2 is the minimum. Higher puts the target further away, so it gets hit less often.")
+    p["stop_mode"] = sb.radio(
+        "🛑 Stop based on", ["ATR", "Target %"], index=["ATR", "Target %"].index(s["stop_mode"]),
+        horizontal=True,
+        help="ATR = the stock's average daily move. 'ATR' puts the stop outside normal daily wiggles, "
+             "and the target follows from your reward:risk. 'Target %' lets you pick the rebound "
+             "(e.g. 4%) and the stop follows. Too tight a stop gets hit by noise.")
     if p["stop_mode"] == "ATR":
-        p["atr_mult"] = sb.number_input("Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25)
+        p["atr_mult"] = sb.number_input(
+            "Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25,
+            help="1.5 means the stop sits 1.5 normal days' worth of movement below your entry.")
         p["target_pct"] = float(s["target_pct"])
     else:
-        p["target_pct"] = sb.number_input("Rebound target (%)", 1.0, 20.0, float(s["target_pct"]), 0.5)
+        p["target_pct"] = sb.number_input(
+            "Rebound target (%)", 1.0, 20.0, float(s["target_pct"]), 0.5,
+            help="How far up you expect the bounce to go. With 1:2, a 4% target means a 2% stop.")
         p["atr_mult"] = float(s["atr_mult"])
-    p["max_hold"] = sb.number_input("⏳ Max holding days", 1, 30, int(s["max_hold"]))
+    p["max_hold"] = sb.number_input(
+        "⏳ Max holding days", 1, 30, int(s["max_hold"]),
+        help="If neither the stop nor the target is hit by this day, you exit anyway. "
+             "Stops you holding a trade just because it hasn't recovered.")
     with sb.expander("🔎 Scan filters"):
-        p["min_mcap_b"] = st.number_input("Min market cap (USD B)", 0.1, 500.0, float(s["min_mcap_b"]), 0.5)
-        p["min_price"] = st.number_input("Min price", 1.0, 500.0, float(s["min_price"]), 1.0)
-        p["min_avg_vol"] = st.number_input("Min avg volume", 100_000, 50_000_000, int(s["min_avg_vol"]), 100_000)
-        p["rsi_max"] = st.slider("RSI below", 10, 50, int(s["rsi_max"]))
-        p["min_rel_vol"] = st.slider("Min relative volume (x)", 1.0, 5.0, float(s["min_rel_vol"]), 0.1)
-        p["min_drop"] = st.slider("Day's change at or below (%)", -20.0, 0.0, float(s["min_drop"]), 0.5)
-        p["bb_tol"] = st.slider("Lower-band tolerance (x)", 1.00, 1.05, float(s["bb_tol"]), 0.005)
-        p["earn_buffer"] = st.number_input("Earnings buffer (days)", 0, 30, int(s["earn_buffer"]))
+        p["rsi_min"], p["rsi_max"] = st.slider(
+            "🌡️ RSI range", 5, 50, (int(s["rsi_min"]), int(s["rsi_max"])),
+            help="RSI (0-100) measures how hard a stock has been sold or bought lately. Under 30 = "
+                 "oversold (sellers exhausted). Under about 15-20 often means real bad news, "
+                 "a 'falling knife'. Stocks below the lower number still show, under Skipped.")
+        p["bb_tol"] = 1 + st.slider(
+            "📏 Lower-band tolerance (%)", 0.0, 5.0, round((float(s["bb_tol"]) - 1) * 100, 1), 0.5,
+            help="The lower Bollinger Band marks 'unusually far below the 20-day average'. 0% = price "
+                 "must touch or break below the band. 1% = within 1% above it also counts.") / 100
+        p["min_rel_vol"] = st.slider(
+            "🔊 Min relative volume (x)", 1.0, 5.0, float(s["min_rel_vol"]), 0.1,
+            help="Today's trading volume compared with a normal day. 1.5x = 50% more shares traded "
+                 "than usual, a sign of panic or forced selling rather than a quiet drift.")
+        p["min_mcap_b"] = st.number_input(
+            "🏢 Min market cap (USD B)", 0.1, 500.0, float(s["min_mcap_b"]), 0.5,
+            help="Company size (share price × shares). Bigger companies are less likely to collapse "
+                 "for good after a bad day.")
+        p["min_price"] = st.number_input(
+            "💲 Min share price", 1.0, 500.0, float(s["min_price"]), 1.0,
+            help="Skips very cheap 'penny' stocks, which jump around wildly.")
+        p["min_avg_vol"] = st.number_input(
+            "💧 Min avg daily volume (shares)", 100_000, 50_000_000, int(s["min_avg_vol"]), 100_000,
+            help="Liquidity. Busy stocks are easy to buy and sell near the price you see.")
+        p["earn_buffer"] = st.number_input(
+            "📣 Earnings buffer (days)", 0, 30, int(s["earn_buffer"]),
+            help="Skips stocks reporting earnings within this many days. Earnings can make a stock "
+                 "jump past your stop overnight.")
     if not HOSTED and sb.button("💾 Save as my defaults", width="stretch"):
         save_settings(p)
         sb.success("Saved.")
@@ -365,6 +436,42 @@ def evaluate(row, p: dict, session: str) -> dict:
     cks = checks(row, plan, news, p)
     failed = [why for _, why, ok in cks if not ok]
     return {"row": row, "ref": ref, "news": news, "plan": plan, "cks": cks, "failed": failed}
+
+
+def tv_symbol(row) -> str:
+    return str(row.get("ticker") or row["name"])
+
+
+def tv_url(row) -> str:
+    return "https://www.tradingview.com/chart/?symbol=" + quote(tv_symbol(row))
+
+
+def chart_widget(row) -> str:
+    """TradingView's free embeddable chart: daily candles with Bollinger Bands and RSI."""
+    cfg = {
+        "autosize": True, "symbol": tv_symbol(row), "interval": "D",
+        "timezone": "America/New_York", "theme": "dark", "style": "1", "locale": "en",
+        "backgroundColor": "rgba(18,24,41,1)", "gridColor": "rgba(35,44,69,0.5)",
+        "hide_side_toolbar": True, "hide_volume": False, "allow_symbol_change": False,
+        "studies": ["STD;Bollinger_Bands", "STD;RSI"], "support_host": "https://www.tradingview.com",
+    }
+    return f"""<style>html,body{{margin:0;height:100%;background:#121829}}</style>
+<div class="tradingview-widget-container" style="height:460px;width:100%">
+<div class="tradingview-widget-container__widget" style="height:460px;width:100%"></div>
+<script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+{json.dumps(cfg)}
+</script></div>"""
+
+
+TIPS = {
+    "day": "How much the price moved in the latest session.",
+    "rsi": "RSI 0-100: how hard it's been sold lately. Under 30 = oversold. Under 15-20 = possible falling knife.",
+    "vol": "Volume vs a normal day. 2x = twice the usual shares traded: a sign of panic selling.",
+    "week": "Price change over the last 5 trading days.",
+    "entry": "Suggested buy price (latest price, ~15 min delayed). 'max' = above this it's no longer at the lower band, so don't chase.",
+    "stop": "Sell here to cap the loss at your max loss.",
+    "target": "Take-profit price, set by your reward:risk.",
+}
 
 
 def card_html(ev: dict, p: dict, session: str) -> str:
@@ -401,23 +508,24 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     return f"""
 <div class="sw sw-card {'skip' if failed else ''}">
   <div class="sw-top">
-    <div><div class="sw-tkr">{esc(row['name'])}</div>
-         <div class="sw-co">{esc(str(row['description']))} · {esc(str(row['sector']))}</div></div>
+    <div><div class="sw-tkr"><a href="{tv_url(row)}" target="_blank" title="Open the chart on TradingView">{esc(row['name'])}<span>↗</span></a></div>
+         <div class="sw-co">{esc(str(row['description']))}</div>
+         <div class="sw-co">🏭 {esc(str(row['sector']))} › {esc(str(row['industry']))}</div></div>
     {chip}
   </div>
   <div class="sw-mini">
-    <div><div class="k">Day</div><div class="v red">{row['change']:+.1f}%</div></div>
-    <div><div class="k">RSI</div><div class="v">{rsi:.0f}</div>
+    <div title="{TIPS['day']}"><div class="k">Day</div><div class="v red">{row['change']:+.1f}%</div></div>
+    <div title="{TIPS['rsi']}"><div class="k">RSI</div><div class="v">{rsi:.0f}</div>
          <div class="sw-meter"><span style="width:{min(rsi, 100):.0f}%;background:{rsi_col}"></span></div></div>
-    <div><div class="k">Vol</div><div class="v {'green' if vol >= p['min_rel_vol'] else ''}">{vol:.1f}x</div></div>
-    <div><div class="k">Week</div><div class="v {'red' if not pd.isna(week) and week < 0 else ''}">{week_txt}</div></div>
+    <div title="{TIPS['vol']}"><div class="k">Vol</div><div class="v {'green' if vol >= p['min_rel_vol'] else ''}">{vol:.1f}x</div></div>
+    <div title="{TIPS['week']}"><div class="k">Week</div><div class="v {'red' if not pd.isna(week) and week < 0 else ''}">{week_txt}</div></div>
   </div>
   <div class="sw-plan">
-    <div class="e"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
+    <div class="e" title="{TIPS['entry']}"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
          <div class="d" style="color:var(--muted)">max {money(bb_line)}</div></div>
-    <div class="s"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
+    <div class="s" title="{TIPS['stop']}"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
          <div class="d red">-{plan['stop_pct']:.1f}%</div></div>
-    <div class="t"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
+    <div class="t" title="{TIPS['target']}"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
          <div class="d green">+{plan['target_pct']:.1f}%</div></div>
   </div>
   <div class="sw-ladder" style="--cut:{cut:.1f}%"><i></i></div>
@@ -434,7 +542,9 @@ def render_candidate(ev: dict, p: dict, session: str):
     row = ev["row"]
     t = row["name"]
     st.markdown(card_html(ev, p, session), unsafe_allow_html=True)
-    with st.expander(f"📰 Why did {t} drop?  ·  checks  ·  edit entry"):
+    with st.expander(f"📈 Chart  ·  📰 why did {t} drop?  ·  ✅ checks"):
+        if st.toggle("📈 Show live chart (Bollinger Bands + RSI)", key=f"chart_{t}"):
+            components.html(chart_widget(row), height=465)
         st.number_input("✏️ Your entry price (plan recalculates)", 0.01, 100_000.0,
                         float(round(ev["ref"], 2)), 0.01, key=f"entry_{t}")
         news_html = "".join(
@@ -449,12 +559,37 @@ def render_candidate(ev: dict, p: dict, session: str):
                             for label, _, ok in ev["cks"]), unsafe_allow_html=True)
 
 
+FG_COLORS = {"extreme fear": "#B3243B", "fear": "#FF5C7A", "neutral": "#FFC94D",
+             "greed": "#8EE6A8", "extreme greed": "#2BD9A0"}
+FG_TIP = ("CNN Fear & Greed Index: the mood of the US stock market from 7 signals (momentum, volatility, "
+          "safe-haven demand and more). 0 = extreme fear (people panic-selling), 100 = extreme greed. "
+          "Fear is when buy-the-panic setups show up, but fear can last a while. Click to open CNN.")
+
+
+def fear_greed_html() -> str:
+    fg = fetch_fear_greed()
+    if fg is None:
+        return (f'<a class="sw-fg" href="{FG_PAGE}" target="_blank" title="{FG_TIP}" style="display:block">'
+                '<div class="k">😨 Fear &amp; Greed</div><div class="r" style="color:var(--muted)">'
+                'Unavailable right now</div><div class="m"><span>Source: CNN ↗</span></div></a>')
+    c = FG_COLORS.get(fg["rating"], "#FFC94D")
+    prev = f"prev {fg['prev']:.0f}" if fg["prev"] is not None else ""
+    week = f"1w ago {fg['week']:.0f}" if fg["week"] is not None else ""
+    return f"""<div class="sw-fg" title="{FG_TIP}">
+  <div class="k">😨 Fear &amp; Greed index</div>
+  <div class="n" style="color:{c}">{fg['score']:.0f}</div>
+  <div class="r" style="color:{c}">{html.escape(fg['rating'])}</div>
+  <div class="bar"><i style="left:{min(max(fg['score'], 0), 100):.0f}%"></i></div>
+  <div class="m"><span>{prev} · {week}</span><a href="{FG_PAGE}" target="_blank">CNN ↗</a></div>
+</div>"""
+
+
 def hero(session: str):
     now_et = datetime.now(ET_TZ)
     cls, emoji = {"open": ("live", "🟢"), "premarket": ("pre", "🌅"),
                   "after hours": ("pre", "🌙")}.get(session, ("off", "🔴"))
     st.markdown(f"""
-<div class="sw sw-hero">
+<div class="sw sw-hero"><div>
   <h1>📉 SkimTrade</h1>
   <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
   <div class="sw-pills">
@@ -462,14 +597,15 @@ def hero(session: str):
     <span class="sw-pill">🗽 New York {now_et:%a %H:%M}</span>
     <span class="sw-pill">⏱️ ~15 min delayed</span>
     <span class="sw-pill">🎯 Lower band · RSI · volume · news</span>
-  </div>
+  </div></div>
+  {fear_greed_html()}
 </div>""", unsafe_allow_html=True)
 
 
 def stats_html(items: list) -> str:
     return ('<div class="sw sw-stats">' + "".join(
-        f'<div class="sw-stat"><div class="n">{n}</div><div class="l">{l}</div></div>' for n, l in items)
-        + "</div>")
+        f'<div class="sw-stat" title="{html.escape(tip)}"><div class="n">{n}</div><div class="l">{l}</div></div>'
+        for n, l, tip in items) + "</div>")
 
 
 def main():
@@ -479,7 +615,7 @@ def main():
     session = market_session()
     hero(session)
 
-    c1, c2 = st.columns([3, 1])
+    c1, c2 = st.columns([2, 1])
     with c1:
         if session.startswith("closed") or session == "after hours":
             st.caption("😴 Market is closed, so this is the last close. Best times to scan: premarket "
@@ -498,34 +634,38 @@ def main():
                 st.error(f"Scan failed: {type(e).__name__}: {e}")
 
     if "raw" not in st.session_state:
-        st.markdown(stats_html([("👆", "Press scan to start"), ("🎯", "1:" + f"{p['rr']:g}" + " reward:risk"),
-                                ("💸", f"${p['max_risk']:g} max loss"), ("⏳", f"{p['max_hold']} day max hold")]),
+        st.markdown(stats_html([("👆", "Press scan to start", ""),
+                                ("🎯", "1:" + f"{p['rr']:g}" + " reward:risk", "Change in the sidebar."),
+                                ("💸", f"${p['max_risk']:g} max loss", "Change in the sidebar."),
+                                ("⏳", f"{p['max_hold']} day max hold", "Change in the sidebar.")]),
                     unsafe_allow_html=True)
         return
 
     raw = st.session_state["raw"].copy()
     sess = st.session_state["session"]
     if raw.empty:
-        st.success("😌 Nothing sold off hard enough with volume. No setup means no trade.")
+        st.success("😌 Nothing is oversold on heavy volume. No setup means no trade.")
         return
     raw["ref"] = [ref_price(r, sess) for _, r in raw.iterrows()]
     near = raw[(raw["ref"] <= raw["BB.lower"] * p["bb_tol"]) | (raw["source"] == "premarket gap")]
-    near = near.sort_values(["RSI", "relative_volume_10d_calc"], ascending=[True, False]).head(12)
+    near = near.sort_values(["RSI", "relative_volume_10d_calc"], ascending=[True, False]).head(16)
     evs = [evaluate(row, p, sess) for _, row in near.iterrows()]
     good = [e for e in evs if not e["failed"]]
     skip = [e for e in evs if e["failed"]]
 
     st.markdown(stats_html([
-        (int((raw["source"] == "sell-off").sum()), "📉 Sold off on volume"),
-        (len(near), "🎯 At the lower band"),
-        (len(good), "✨ Worth a look"),
-        (int((raw["source"] == "premarket gap").sum()), "🌙 Premarket gaps"),
+        (int((raw["source"] == "sell-off").sum()), "📉 Oversold on volume",
+         f"RSI under {p['rsi_max']} with at least {p['min_rel_vol']}x normal volume."),
+        (len(near), "🎯 At the lower band", "Of those, how many are at or below the lower Bollinger Band."),
+        (len(good), "✨ Worth a look", "Passed every automatic check. Still read the news before deciding."),
+        (int((raw["source"] == "premarket gap").sum()), "🌙 Premarket gaps",
+         f"Stocks down more than {abs(PREMARKET_GAP):g}% before the open (overnight shocks). Only during premarket."),
     ]), unsafe_allow_html=True)
     st.caption(f"Last scan {st.session_state['ran_at']} New York time. "
                "Passing every check only means nothing ruled it out. The call is yours.")
 
     if not evs:
-        st.warning("Stocks sold off, but none are at the lower Bollinger Band. No trade today. 🧘")
+        st.warning("Some stocks are oversold, but none are at the lower Bollinger Band. No trade today. 🧘")
         return
     if good:
         st.markdown('<div class="sw sw-section">✨ Worth a look</div>', unsafe_allow_html=True)
