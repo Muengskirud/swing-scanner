@@ -368,6 +368,22 @@ div[data-testid="stTooltipContent"], div[data-baseweb="tooltip"] > div {
   border: 1px solid rgba(139,108,255,.55) !important; box-shadow: 0 18px 40px rgba(0,0,0,.55) !important; }
 div[data-testid="stTooltipContent"] p { font-family: 'Montserrat', sans-serif !important; font-size: .8rem !important;
   line-height: 1.5 !important; color: var(--text) !important; }
+/* sidebar labels with a (?) whose bubble opens to the right, over the empty main area */
+.sw-lbl { display: flex; justify-content: space-between; align-items: center; font-size: .86rem;
+          font-weight: 600; color: var(--text); margin: 8px 0 4px; }
+.sw-q { display: inline-block; text-align: center; line-height: 14px; width: 17px; height: 17px; box-sizing: border-box;
+        border-radius: 50%; border: 1.5px solid var(--muted); color: var(--muted); font-size: .66rem;
+        font-weight: 800; flex: none; transition: all .15s; }
+.sw-q:hover { border-color: var(--violet); color: #fff; background: var(--violet); }
+.sw-q[data-tip]:hover::after, .sw-q[data-tip]:hover::before { display: none; }
+.sw-float { position: fixed; z-index: 2147483000; width: 260px; min-height: 150px; box-sizing: border-box;
+  display: flex; align-items: center; padding: 16px 18px; border-radius: 18px; pointer-events: none;
+  background: linear-gradient(160deg, #241C4A 0%, #182036 70%); border: 1px solid rgba(139,108,255,.55);
+  box-shadow: 0 18px 40px rgba(0,0,0,.55); color: #E8EBF5; font-family: 'Montserrat', sans-serif;
+  font-size: .78rem; font-weight: 500; line-height: 1.5; animation: swpop .15s ease-out; }
+div[data-testid="stElementContainer"]:has(iframe[height="0"]) { display: none; }
+.sw-float::before { content: ""; position: absolute; left: -15px; top: var(--ay, 24px); margin-top: -7px;
+  border: 7px solid transparent; border-right-color: rgba(139,108,255,.75); }
 .sw-tkr a { color: var(--text) !important; text-decoration: none; }
 .sw-tkr a:hover { color: var(--violet) !important; }
 .sw-tkr a span { font-size: .8rem; color: var(--muted); margin-left: 4px; }
@@ -382,64 +398,102 @@ def money(x: float) -> str:
 
 
 # ---------------------------------------------------------------- UI: sidebar
+TIP_JS = """<script>
+(function () {
+  const doc = window.parent.document;
+  if (window.parent.__swTips) return;
+  window.parent.__swTips = true;
+  let tip = null;
+  doc.addEventListener("mouseover", (e) => {
+    const q = e.target.closest && e.target.closest(".sw-q");
+    if (!q) return;
+    if (!tip) { tip = doc.createElement("div"); tip.className = "sw-float"; doc.body.appendChild(tip); }
+    tip.textContent = q.getAttribute("data-tip");
+    tip.style.display = "flex";
+    const r = q.getBoundingClientRect(), h = tip.offsetHeight, vh = window.parent.innerHeight;
+    const cy = r.top + r.height / 2;
+    const top = Math.max(12, Math.min(cy - 28, vh - h - 12));
+    const sb = q.closest('section[data-testid="stSidebar"]');
+    const edge = sb ? sb.getBoundingClientRect().right : r.right;
+    tip.style.left = (Math.max(r.right, edge) + 18) + "px";
+    tip.style.top = top + "px";
+    tip.style.setProperty("--ay", (cy - top) + "px");
+  });
+  doc.addEventListener("mouseout", (e) => {
+    const q = e.target.closest && e.target.closest(".sw-q");
+    if (q && tip) tip.style.display = "none";
+  });
+})();
+</script>"""
+
+
+def field(where, kind: str, label: str, *args, help: str = "", **kw):
+    """Sidebar input with our own label and (?) bubble, which opens to the right of the
+    sidebar instead of covering the inputs like Streamlit's built-in help tooltip."""
+    q = f'<span class="sw-q" data-tip="{html.escape(help)}">?</span>' if help else ""
+    where.markdown(f'<div class="sw sw-lbl"><span>{html.escape(label)}</span>{q}</div>',
+                   unsafe_allow_html=True)
+    return getattr(where, kind)(label, *args, label_visibility="collapsed", **kw)
+
+
 def sidebar() -> dict:
     s = load_settings()
     sb = st.sidebar
     sb.markdown("### ⚙️ Your rules")
     p = {}
-    p["max_risk"] = sb.number_input(
+    p["max_risk"] = field(sb, "number_input", 
         "💸 Max loss per trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0,
         help="The most you're willing to lose if the stop is hit. The app works out how many shares "
              "to buy so that hitting the stop costs about this much. Shares = max loss ÷ (entry − stop).")
-    p["rr"] = sb.number_input(
+    p["rr"] = field(sb, "number_input", 
         "🎯 Reward : risk (1 : x)", MIN_RR, 10.0, max(float(s["rr"]), MIN_RR), 0.5,
         help="How much you aim to make for every $1 you risk. 1:2 means risk $35 to make $70. "
              "1:2 is the minimum. Higher puts the target further away, so it gets hit less often.")
-    p["stop_mode"] = sb.radio(
+    p["stop_mode"] = field(sb, "radio", 
         "🛑 Stop based on", ["ATR", "Target %"], index=["ATR", "Target %"].index(s["stop_mode"]),
         horizontal=True,
         help="ATR = the stock's average daily move. 'ATR' puts the stop outside normal daily wiggles, "
              "and the target follows from your reward:risk. 'Target %' lets you pick the rebound "
              "(e.g. 4%) and the stop follows. Too tight a stop gets hit by noise.")
     if p["stop_mode"] == "ATR":
-        p["atr_mult"] = sb.number_input(
+        p["atr_mult"] = field(sb, "number_input", 
             "Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25,
             help="1.5 means the stop sits 1.5 normal days' worth of movement below your entry.")
         p["target_pct"] = float(s["target_pct"])
     else:
-        p["target_pct"] = sb.number_input(
+        p["target_pct"] = field(sb, "number_input", 
             "Rebound target (%)", 1.0, 20.0, float(s["target_pct"]), 0.5,
             help="How far up you expect the bounce to go. With 1:2, a 4% target means a 2% stop.")
         p["atr_mult"] = float(s["atr_mult"])
-    p["max_hold"] = sb.number_input(
+    p["max_hold"] = field(sb, "number_input", 
         "⏳ Max holding days", 1, 30, int(s["max_hold"]),
         help="If neither the stop nor the target is hit by this day, you exit anyway. "
              "Stops you holding a trade just because it hasn't recovered.")
     with sb.expander("🔎 Scan filters"):
-        p["rsi_min"], p["rsi_max"] = st.slider(
+        p["rsi_min"], p["rsi_max"] = field(st, "slider", 
             "🌡️ RSI range", 5, 50, (int(s["rsi_min"]), int(s["rsi_max"])),
             help="RSI (0-100) measures how hard a stock has been sold or bought lately. Under 30 = "
                  "oversold (sellers exhausted). Under about 15-20 often means real bad news, "
                  "a 'falling knife'. Stocks below the lower number still show, under Skipped.")
-        p["bb_tol"] = 1 + st.slider(
+        p["bb_tol"] = 1 + field(st, "slider", 
             "📏 Lower-band tolerance (%)", 0.0, 5.0, round((float(s["bb_tol"]) - 1) * 100, 1), 0.5,
             help="The lower Bollinger Band marks 'unusually far below the 20-day average'. 0% = price "
                  "must touch or break below the band. 1% = within 1% above it also counts.") / 100
-        p["min_rel_vol"] = st.slider(
+        p["min_rel_vol"] = field(st, "slider", 
             "🔊 Min relative volume (x)", 1.0, 5.0, float(s["min_rel_vol"]), 0.1,
             help="Today's trading volume compared with a normal day. 1.5x = 50% more shares traded "
                  "than usual, a sign of panic or forced selling rather than a quiet drift.")
-        p["min_mcap_b"] = st.number_input(
+        p["min_mcap_b"] = field(st, "number_input", 
             "🏢 Min market cap (USD B)", 0.1, 500.0, float(s["min_mcap_b"]), 0.5,
             help="Company size (share price × shares). Bigger companies are less likely to collapse "
                  "for good after a bad day.")
-        p["min_price"] = st.number_input(
+        p["min_price"] = field(st, "number_input", 
             "💲 Min share price", 1.0, 500.0, float(s["min_price"]), 1.0,
             help="Skips very cheap 'penny' stocks, which jump around wildly.")
-        p["min_avg_vol"] = st.number_input(
+        p["min_avg_vol"] = field(st, "number_input", 
             "💧 Min avg daily volume (shares)", 100_000, 50_000_000, int(s["min_avg_vol"]), 100_000,
             help="Liquidity. Busy stocks are easy to buy and sell near the price you see.")
-        p["earn_buffer"] = st.number_input(
+        p["earn_buffer"] = field(st, "number_input", 
             "📣 Earnings buffer (days)", 0, 30, int(s["earn_buffer"]),
             help="Skips stocks reporting earnings within this many days. Earnings can make a stock "
                  "jump past your stop overnight.")
@@ -642,6 +696,7 @@ def stats_html(items: list) -> str:
 def main():
     st.set_page_config(page_title="SkimTrade", page_icon="📉", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+    components.html(TIP_JS, height=0)
     p = sidebar()
     session = market_session()
     hero(session)
