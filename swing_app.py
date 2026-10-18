@@ -296,8 +296,27 @@ header[data-testid="stHeader"] { background: transparent; }
 .sw-pill.live { border-color: rgba(43,217,160,.5); color: var(--green); }
 .sw-pill.pre  { border-color: rgba(255,181,71,.5); color: var(--amber); }
 .sw-pill.off  { border-color: rgba(255,92,122,.4); color: #FF9AAE; }
-.sw-pill.cd   { background: rgba(139,108,255,.16); border-color: rgba(139,108,255,.55); }
-.sw-pill.cd b { font-weight: 800; }
+/* ticker tape */
+.sw-tape { grid-column: 1 / -1; display: flex; align-items: stretch; margin-top: 4px; height: 40px;
+  border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: rgba(5,8,16,.55); }
+.sw-status { display: flex; align-items: center; gap: 8px; padding: 0 14px; flex: none; white-space: nowrap;
+  font-size: .72rem; font-weight: 800; text-transform: uppercase; letter-spacing: .8px;
+  border-right: 1px solid var(--line); background: rgba(255,255,255,.04); }
+.sw-status i { width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+  box-shadow: 0 0 10px currentColor; animation: swblink 1.6s ease-in-out infinite; }
+.sw-status.live { color: var(--green); } .sw-status.pre { color: var(--amber); } .sw-status.off { color: #FF7A93; }
+.sw-roll { position: relative; flex: 1; overflow: hidden;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
+          mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent); }
+.sw-track { display: inline-flex; align-items: center; height: 100%; white-space: nowrap;
+  animation: swroll 40s linear infinite; }
+.sw-tape:hover .sw-track { animation-play-state: paused; }
+.sw-tick { display: inline-flex; align-items: center; gap: 6px; padding: 0 22px; font-size: .82rem;
+  font-weight: 600; color: var(--muted); }
+.sw-tick b { color: var(--text); font-weight: 800; }
+.sw-tick::after { content: "◆"; margin-left: 44px; font-size: .5rem; color: var(--violet); opacity: .8; }
+@keyframes swroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+@keyframes swblink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
 .sw-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 6px 0 22px; }
 .sw-stat { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; }
@@ -723,21 +742,23 @@ def fear_greed_html() -> str:
 def hero(session: str):
     now_et = datetime.now(ET_TZ)
     label, target = next_session_event()
-    cls, emoji = {"open": ("live", "🟢"), "premarket": ("pre", "🌅"),
-                  "after hours": ("pre", "🌙")}.get(session, ("off", "🔴"))
+    cls = {"open": "live", "premarket": "pre", "after hours": "pre"}.get(session, "off")
+    items = "".join(f'<span class="sw-tick">{x}</span>' for x in [
+        f'⏳ {label} in <b class="sw-cd" data-until="{int(target.timestamp() * 1000)}">{countdown(target)}</b>',
+        f'🗽 New York <b class="sw-clock" data-tz="America/New_York">{now_et:%a %H:%M}</b>',
+        f'🇸🇬 Singapore <b class="sw-clock" data-tz="Asia/Singapore">{now_et.astimezone(SG_TZ):%a %H:%M}</b>',
+        '🎯 Lower band <b>·</b> RSI <b>·</b> volume <b>·</b> news',
+    ])
     st.markdown(f"""
 <div class="sw sw-hero"><div>
   <h1>📉 SkimTrade</h1>
   <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
-  <div class="sw-pills">
-    <span class="sw-pill {cls}">{emoji} Market {session}</span>
-    <span class="sw-pill cd">⏳ {label} in <b class="sw-cd" data-until="{int(target.timestamp() * 1000)}">{countdown(target)}</b></span>
-    <span class="sw-pill">🗽 New York <span class="sw-clock" data-tz="America/New_York">{now_et:%a %H:%M}</span></span>
-    <span class="sw-pill">🇸🇬 Singapore <span class="sw-clock" data-tz="Asia/Singapore">{now_et.astimezone(SG_TZ):%a %H:%M}</span></span>
-    <span class="sw-pill">⏱️ ~15 min delayed</span>
-    <span class="sw-pill">🎯 Lower band · RSI · volume · news</span>
-  </div></div>
+  </div>
   {fear_greed_html()}
+  <div class="sw-tape">
+    <span class="sw-status {cls}"><i></i>Market {session}</span>
+    <div class="sw-roll"><div class="sw-track">{items * 2}{items * 2}</div></div>
+  </div>
 </div>""", unsafe_allow_html=True)
 
 
