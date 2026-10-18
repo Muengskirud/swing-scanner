@@ -637,7 +637,7 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     week = row["Perf.W"]
     week_txt = "n/a" if pd.isna(week) else f"{week:+.1f}%"
     chip = ('<span class="sw-chip no">⛔ Skip</span>' if failed
-            else '<span class="sw-chip go">✨ Worth a look</span>')
+            else '<span class="sw-chip go">Worth a look</span>')
     cut = 100 / (1 + p["rr"])
     bb_line = row["BB.lower"] * p["bb_tol"]
 
@@ -752,7 +752,6 @@ def hero_html(session: str, picks: list) -> str:
         f'🇸🇬 Singapore <b class="sw-clock" data-tz="Asia/Singapore">{now_et.astimezone(SG_TZ):%a %H:%M:%S}</b>',
     ]
     if picks:
-        ticks.append('✨ <b>Worth a look</b>')
         ticks += [f'<b>{html.escape(t)}</b> <span class="{"red" if c < 0 else "green"}">'
                   f'{"▼" if c < 0 else "▲"} {abs(c):.1f}%</span>' for t, c in picks]
     else:
@@ -807,7 +806,6 @@ def results(p: dict, session: str) -> list:
         with st.spinner("Scanning the market for panic sells..."):
             try:
                 st.session_state["raw"] = run_scan(p, session)
-                st.session_state["ran_at"] = datetime.now(ET_TZ).strftime("%a %H:%M")
                 st.session_state["session"] = session
             except Exception as e:
                 st.session_state.pop("raw", None)
@@ -837,18 +835,16 @@ def results(p: dict, session: str) -> list:
         (int((raw["source"] == "sell-off").sum()), "📉 Oversold on volume",
          f"RSI under {p['rsi_max']} with at least {p['min_rel_vol']}x normal volume."),
         (len(near), "🎯 At the lower band", "Of those, how many are at or below the lower Bollinger Band."),
-        (len(good), "✨ Worth a look", "Passed every automatic check. Still read the news before deciding."),
+        (len(good), "Worth a look", "Passed every automatic check. Still read the news before deciding."),
         (int((raw["source"] == "premarket gap").sum()), "🌙 Premarket gaps",
          f"Stocks down more than {abs(PREMARKET_GAP):g}% before the open (overnight shocks). Only during premarket."),
     ]), unsafe_allow_html=True)
-    st.caption(f"Last scan {st.session_state['ran_at']} New York time. "
-               "Passing every check only means nothing ruled it out. The call is yours.")
 
     if not evs:
         st.warning("Some stocks are oversold, but none are at the lower Bollinger Band. No trade today. 🧘")
         return []
     if good:
-        st.markdown('<div class="sw sw-section">✨ Worth a look</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sw sw-section">Worth a look</div>', unsafe_allow_html=True)
         cols = st.columns(2, gap="medium")
         for i, e in enumerate(good):
             with cols[i % 2]:
