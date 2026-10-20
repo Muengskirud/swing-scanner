@@ -223,3 +223,17 @@ def test_position_peg_too_high():
     plan = s.position_plan(100.0, 160.0, P)
     cks = s.position_checks(fundamentals(price_earnings_growth_ttm=2.4), plan, [], P)
     assert pos_line(cks, "PEG")[1] == "PEG 2.4: pricey for its growth" and pos_line(cks, "PEG")[2] is False
+
+
+# ---------------------------------------------------------------- 2x ETF option
+def test_leveraged_plan_doubles_distances_and_halves_dollars():
+    plan = s.build_plan(100.0, 4.0, P)  # stock: stop -6%, target +18%, $35 risk = $583 of stock
+    lev = s.leveraged_plan(plan, P)
+    assert lev["stop_pct"] == pytest.approx(12.0)
+    assert lev["target_pct"] == pytest.approx(36.0)
+    assert lev["dollars"] == pytest.approx(35 / 0.12)  # same $35 risk, half the dollars
+
+
+def test_leveraged_map_has_the_users_etfs():
+    assert "MULL" in s.LEVERAGED_2X["MU"] and "SNXX" in s.LEVERAGED_2X["SNDK"]
+    assert all(e.isupper() and 3 <= len(e) <= 5 for v in s.LEVERAGED_2X.values() for e in v)

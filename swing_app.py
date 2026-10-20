@@ -50,6 +50,17 @@ COLUMNS = [
     "open", "SMA20", "open[1]", "close[1]", "close[2]", "RSI[1]", "RSI[2]",
     "BB.lower[1]", "BB.lower[2]", "relative_volume_10d_calc[1]",
 ]
+# 2x long single-stock ETFs, most traded first. Each was checked on Yahoo Finance on 2026-10-20
+# (exists, trades, fund name matches the stock). TradingView's screener returns no ETFs, so this
+# list is maintained by hand: new funds launch and old ones close.
+LEVERAGED_2X = {
+    "MU": ["MUU", "MULL"], "SNDK": ["SNXX"], "NVDA": ["NVDL", "NVDX", "NVDU"], "TSLA": ["TSLL", "TSLT"],
+    "AAPL": ["AAPU"], "AMZN": ["AMZU"], "GOOGL": ["GGLL"], "META": ["METU", "FBL"], "MSFT": ["MSFU", "MSFL"],
+    "COIN": ["CONL"], "MSTR": ["MSTU", "MSTX"], "PLTR": ["PTIR", "PLTU"], "AMD": ["AMDL", "AMUU"],
+    "AVGO": ["AVL", "AVGX", "AVGU"], "SMCI": ["SMCX"], "NFLX": ["NFXL"], "HOOD": ["HOOG", "HOOX"],
+    "ARM": ["ARMG"], "INTC": ["INTW"], "BABA": ["BABX"], "UBER": ["UBRL"], "SOFI": ["SOFX"], "RIVN": ["RVNL"],
+    "CRWV": ["CWVX"], "IREN": ["IREX"], "RGTI": ["RGTX"], "IONQ": ["IONX"], "OKLO": ["OKLL"],
+}
 POS_COLUMNS = [
     "name", "description", "close", "change", "sector", "industry", "market_cap_basic", "ATR",
     "SMA200", "Perf.W", "Perf.Y", "price_52_week_high", "price_52_week_low",
@@ -246,6 +257,15 @@ def trigger_failures(t: dict, p: dict) -> list:
     if not t["volume"]:
         out.append("volume unknown" if t["rel_vol"] is None else f"volume only {t['rel_vol']:.1f}x average")
     return out
+
+
+def leveraged_plan(plan: dict, p: dict, leverage: float = 2.0) -> dict:
+    """The same trade through a 2x ETF, approximately: the ETF moves about 2x the stock each day,
+    so the stop and target distances double, and to keep the same dollar risk you buy half the
+    dollar amount. Daily resets make this drift from exactly 2x over multi-day holds."""
+    stop_pct = leverage * plan["stop_pct"]
+    return {"stop_pct": stop_pct, "target_pct": leverage * plan["target_pct"],
+            "dollars": p["max_risk"] / (stop_pct / 100) if stop_pct > 0 else 0.0}
 
 
 # ---------------------------------------------------------------- plan + checks
@@ -592,6 +612,12 @@ div[data-testid="stElementContainer"]:has(iframe[height="0"]) { display: none; }
 .st-key-layman { opacity: .6; transition: opacity .15s; }
 .st-key-layman:hover { opacity: 1; }
 .st-key-layman label p { font-size: .75rem !important; font-weight: 600; }
+.sw-lev { margin-top: 12px; padding: 9px 12px; border-radius: 12px; font-size: .78rem; font-weight: 600;
+  color: var(--muted); background: rgba(139,108,255,.08); border: 1px dashed rgba(139,108,255,.45);
+  display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.sw-lev b { color: var(--text); }
+.sw-lev a { color: var(--violet) !important; text-decoration: none; font-weight: 800; }
+.sw-lev span { flex-basis: 100%; }
 .sw-tkr a { color: var(--text) !important; text-decoration: none; }
 .sw-tkr a:hover { color: var(--violet) !important; }
 .sw-tkr a span { font-size: .8rem; color: var(--muted); margin-left: 4px; }
@@ -814,6 +840,7 @@ TIPS = {
     "entry": "Suggested buy price (latest price, ~15 min delayed). Below it: how much this stock normally moves in a day (ATR).",
     "stop": "If the price falls to here, you sell. This caps the loss at about your max loss. Never move it lower once you're in.",
     "target": "Take-profit price: your reward:risk times the stop distance above your entry (3x by default).",
+    "lev": "Same trade through a 2x leveraged ETF, approximately. It moves about twice the stock each day, so the stop and target are twice as far and you buy half the dollars to risk the same amount. It resets daily, so over many days it drifts from exactly 2x and loses value in choppy markets. Gaps hit twice as hard. Not part of your tested rules.",
 }
 
 
@@ -829,6 +856,13 @@ def card_html(ev: dict, p: dict, session: str) -> str:
             else '<span class="sw-chip go">Worth a look</span>')
     rr = plan["rr"]
     cut = min(max(100 / (1 + rr), 4), 96) if rr > 0 else 96
+    etfs = LEVERAGED_2X.get(str(row["name"]), [])
+    lev = leveraged_plan(plan, p)
+    lev_html = (f'<div class="sw-lev" data-tip="{TIPS["lev"]}">⚡ <b>2x ETF</b> '
+                + " · ".join(f'<a href="https://www.tradingview.com/chart/?symbol={quote(e)}" target="_blank">{html.escape(e)}</a>'
+                             for e in etfs)
+                + f'<span>stop <b class="red">-{lev["stop_pct"]:.1f}%</b> · target <b class="green">+{lev["target_pct"]:.1f}%</b>'
+                  f' · buy about <b>{money(lev["dollars"])}</b> to risk ${p["max_risk"]:g}</span></div>') if etfs else ""
     k = ev["setup_k"]
     setup_txt = ("📍 No oversold setup in the last few sessions" if k is None else
                  "📍 Setup in the latest session" if k == 0 else
@@ -880,7 +914,7 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     <span>💸 risk <b>{money(plan['risk'])}</b> · <b>1:{max(rr, 0):.1f}</b></span>
     <span>⏳ exit by day <b>{p['max_hold']}</b></span>
   </div>
-  {why}{tag_html}
+  {lev_html}{why}{tag_html}
 </div>"""
 
 
@@ -1021,12 +1055,6 @@ def fear_greed_html() -> str:
 </div>"""
 
 
-SUBTITLES = {
-    "Swing": "Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.",
-    "Position": "Growing companies trading below what analysts think they're worth. Buy value, hold for the story.",
-}
-
-
 def hero_html(session: str, picks: list, mode: str = "Swing") -> str:
     now_et = datetime.now(ET_TZ)
     label, target = next_session_event()
@@ -1049,7 +1077,6 @@ def hero_html(session: str, picks: list, mode: str = "Swing") -> str:
 <div class="sw sw-hero"><div>
   <div class="sw-bless">May God bless this trade. Amen ✝️</div>
   <h1>📉 SkimTrade</h1>
-  <div class="sub">{SUBTITLES[mode]}</div>
   </div>
   {fear_greed_html()}
   <div class="sw-tape">
