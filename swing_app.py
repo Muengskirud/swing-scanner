@@ -34,6 +34,9 @@ HOSTED = os.environ.get("SWING_HOSTED") == "1" or HERE.startswith("/mount/src")
 ET_TZ = ZoneInfo("America/New_York")
 SG_TZ = ZoneInfo("Asia/Singapore")
 MIN_RR = 2.0  # strategy floor: never plan below 1:2
+MAX_RR = 5.0  # highest minimum reward:risk the sidebar allows
+SETUP_LOOKBACK = 3  # setup must appear in the last 3 completed sessions
+MAX_BARS_BACK = 2  # TradingView serves field[1] and field[2]; field[3] comes back empty (checked 2026-10-20)
 PREMARKET_GAP = -3.0  # premarket move (%) that counts as an overnight shock
 FG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 FG_PAGE = "https://www.cnn.com/markets/fear-and-greed"
@@ -43,10 +46,12 @@ COLUMNS = [
     "relative_volume_10d_calc", "average_volume_10d_calc", "market_cap_basic",
     "sector", "industry", "earnings_release_next_date", "earnings_release_date",
     "SMA200", "Perf.W", "premarket_close", "premarket_change", "update_mode",
+    # setup + reversal trigger and the 20-day-average target
+    "open", "SMA20", "open[1]", "close[1]", "close[2]", "RSI[1]", "RSI[2]",
+    "BB.lower[1]", "BB.lower[2]", "relative_volume_10d_calc[1]",
 ]
 DEFAULTS = {
-    "layman": False, "max_risk": 35, "rr": 2.0, "stop_mode": "ATR", "atr_mult": 1.5,
-    "target_pct": 4.0, "max_hold": 7,
+    "layman": False, "max_risk": 35, "rr": 2.0, "atr_mult": 1.5, "max_hold": 7,
     "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_min": 20, "rsi_max": 35,
     "min_rel_vol": 1.5, "bb_tol": 1.01, "earn_buffer": 7,
 }
@@ -64,9 +69,12 @@ def load_settings() -> dict:
     s = dict(DEFAULTS)
     try:
         with open(SETTINGS, encoding="utf-8") as f:
-            s.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
-    except (OSError, ValueError):
+            saved = json.load(f)
+        # keys from older versions (e.g. stop_mode, target_pct) are simply ignored
+        s.update({k: v for k, v in saved.items() if k in DEFAULTS})
+    except (OSError, ValueError, AttributeError):
         pass
+    s["rr"] = min(max(float(s["rr"]), MIN_RR), MAX_RR)
     return s
 
 
@@ -128,16 +136,17 @@ def _base_filters(p: dict) -> list:
     ]
 
 
-def scan(p: dict) -> pd.DataFrame:
-    """Oversold stocks trading on heavy volume in the latest session. The lower-band and
-    RSI-floor checks run afterwards so names that fail them can be shown with the reason."""
+def scan(p: dict, session: str) -> pd.DataFrame:
+    """Stocks with an oversold setup (RSI under the limit and a close at or below the lower
+    Bollinger Band) in the last 3 completed sessions. Whether a reversal has triggered is a
+    check on each card, so setups still waiting for a trigger show up under Skipped."""
     q = (Query().set_markets("america").select(*COLUMNS)
-         .where(*_base_filters(p),
-                col("RSI") < p["rsi_max"],
-                col("relative_volume_10d_calc") > p["min_rel_vol"])
-         .order_by("RSI", ascending=True).limit(500))
+         .where(*_base_filters(p)).order_by("RSI", ascending=True).limit(3000))
     _, df = q.get_scanner_data()
-    df["source"] = "sell-off"
+    if df.empty:
+        return df.assign(source=pd.Series(dtype=str))
+    df = df[[find_setup(r, p, session) is not None for _, r in df.iterrows()]].copy()
+    df["source"] = "setup"
     return df
 
 
@@ -152,7 +161,7 @@ def scan_premarket_gaps(p: dict) -> pd.DataFrame:
 
 
 def run_scan(p: dict, session: str) -> pd.DataFrame:
-    frames = [scan(p)]
+    frames = [scan(p, session)]
     if session == "premarket":
         frames.append(scan_premarket_gaps(p))
     df = pd.concat(frames, ignore_index=True).drop_duplicates("name", keep="first")
@@ -169,21 +178,84 @@ def ref_price(row, session: str) -> float:
     return float(row["close"])
 
 
+# ---------------------------------------------------------------- setup + trigger
+def bar(row, field: str, k: int):
+    """Value of a daily-bar field k sessions back (0 = TradingView's current bar), or None."""
+    v = row.get(field if k == 0 else f"{field}[{k}]")
+    return None if v is None or pd.isna(v) else float(v)
+
+
+def completed_offset(session: str) -> int:
+    """TradingView's current daily bar is still forming while the market is open, so the latest
+    completed session is one bar back. Premarket, after hours and closed: bar 0 is complete."""
+    return 1 if session == "open" else 0
+
+
+def find_setup(row, p: dict, session: str):
+    """Sessions ago (0 = latest completed session) of the most recent setup day: RSI under
+    rsi_max and a close at or below the lower Bollinger Band (with the band tolerance).
+    Looks back SETUP_LOOKBACK completed sessions, limited by what TradingView serves."""
+    o = completed_offset(session)
+    for k in range(o, min(o + SETUP_LOOKBACK, MAX_BARS_BACK + 1)):
+        rsi, close, lower = bar(row, "RSI", k), bar(row, "close", k), bar(row, "BB.lower", k)
+        if None not in (rsi, close, lower) and rsi < p["rsi_max"] and close <= lower * p["bb_tol"]:
+            return k - o
+    return None
+
+
+def trigger(row, p: dict, session: str) -> dict:
+    """Reversal on the latest completed session: green close (above its open and above the
+    previous close), RSI higher than the day before, relative volume at least min_rel_vol."""
+    o = completed_offset(session)
+    c, op, pc = bar(row, "close", o), bar(row, "open", o), bar(row, "close", o + 1)
+    rsi, prsi = bar(row, "RSI", o), bar(row, "RSI", o + 1)
+    rv = bar(row, "relative_volume_10d_calc", o)
+    t = {
+        "above_open": None not in (c, op) and c > op,
+        "above_prev": None not in (c, pc) and c > pc,
+        "rsi_up": None not in (rsi, prsi) and rsi > prsi,
+        "volume": rv is not None and rv >= p["min_rel_vol"],
+        "rel_vol": rv,
+    }
+    t["green"] = t["above_open"] and t["above_prev"]
+    t["ok"] = t["green"] and t["rsi_up"] and t["volume"]
+    return t
+
+
+def trigger_failures(t: dict, p: dict) -> list:
+    out = []
+    if not t["above_open"]:
+        out.append("closed red (below its open)")
+    elif not t["above_prev"]:
+        out.append("closed below the previous close")
+    if not t["rsi_up"]:
+        out.append("RSI still falling")
+    if not t["volume"]:
+        out.append("volume unknown" if t["rel_vol"] is None else f"volume only {t['rel_vol']:.1f}x average")
+    return out
+
+
 # ---------------------------------------------------------------- plan + checks
-def build_plan(entry: float, atr: float, p: dict) -> dict:
-    """Size purely from the dollar risk: shares = max loss / (entry - stop)."""
-    if p["stop_mode"] == "ATR":
-        stop_dist = p["atr_mult"] * atr
-    else:
-        stop_dist = entry * p["target_pct"] / 100 / p["rr"]
+def reward_risk(entry: float, stop: float, target: float) -> float:
+    """(target - entry) / (entry - stop). Negative when the target is below the entry."""
+    return (target - entry) / (entry - stop) if entry > stop else 0.0
+
+
+def build_plan(entry: float, atr: float, target: float, p: dict) -> dict:
+    """Stop = entry - ATR multiple; target = the 20-day average (Bollinger middle band);
+    shares = max loss / (entry - stop)."""
+    stop_dist = p["atr_mult"] * atr
     shares = math.floor(p["max_risk"] / stop_dist) if stop_dist > 0 else 0
+    stop = entry - stop_dist
     return {
         "entry": round(entry, 2),
-        "stop": round(entry - stop_dist, 2),
-        "target": round(entry + p["rr"] * stop_dist, 2),
+        "stop": round(stop, 2),
+        "target": round(target, 2),
+        "rr": reward_risk(entry, stop, target),
+        "max_entry": round(target - p["rr"] * stop_dist, 2),  # highest entry that still meets the minimum
         "stop_dist": stop_dist,
         "stop_pct": round(100 * stop_dist / entry, 2) if entry else 0,
-        "target_pct": round(100 * p["rr"] * stop_dist / entry, 2) if entry else 0,
+        "target_pct": round(100 * (target - entry) / entry, 2) if entry else 0,
         "stop_atr": round(stop_dist / atr, 2) if atr else 0,
         "shares": shares,
         "position": round(shares * entry, 2),
@@ -197,23 +269,34 @@ def days_from_now(ts):
     return (datetime.fromtimestamp(float(ts), tz=timezone.utc) - datetime.now(timezone.utc)).days
 
 
-def checks(row, plan, news, p) -> list:
+def checks(row, plan, news, p, session: str, setup_k, trig: dict) -> list:
     """Automatic pre-checks. Each is (pass label, failure in plain words, ok).
     These can only rule things out, never confirm a thesis."""
     ed = days_from_now(row["earnings_release_next_date"])
     levels = [x["level"] for x in news]
-    bb_line = row["BB.lower"] * p["bb_tol"]
+    o = completed_offset(session)
+    setup_rsi = bar(row, "RSI", o + (setup_k or 0))
+    rsi_txt = "unknown" if setup_rsi is None else f"{setup_rsi:.0f}"
+    look = min(SETUP_LOOKBACK, MAX_BARS_BACK + 1 - o)
+    miss = trigger_failures(trig, p)
+    rr_ok = plan["rr"] >= p["rr"] - 1e-9
     return [
-        ("At or below lower Bollinger Band",
-         f"price is {row['bb_dist_pct']:+.1f}% vs the lower band (limit ${bb_line:.2f})",
-         plan["entry"] <= bb_line),
-        (f"RSI between {p['rsi_min']} and {p['rsi_max']}",
-         (f"RSI {row['RSI']:.0f} is below {p['rsi_min']}: falling-knife zone, check the news hard"
-          if row["RSI"] < p["rsi_min"] else f"RSI {row['RSI']:.0f} is not under {p['rsi_max']}"),
-         p["rsi_min"] <= row["RSI"] < p["rsi_max"]),
-        (f"Volume at least {p['min_rel_vol']}x average",
-         f"volume only {row['relative_volume_10d_calc']:.1f}x average",
-         row["relative_volume_10d_calc"] >= p["min_rel_vol"]),
+        (f"Setup: closed at or below the lower Bollinger Band with RSI under {p['rsi_max']} "
+         f"(last {look} sessions)",
+         f"no close at or below the lower band with RSI under {p['rsi_max']} in the last {look} sessions",
+         setup_k is not None),
+        (f"RSI between {p['rsi_min']} and {p['rsi_max']} on the setup day",
+         ("no setup day to check RSI on" if setup_k is None else
+          f"RSI {rsi_txt} on the setup day is below {p['rsi_min']}: falling-knife zone, check the news hard"
+          if setup_rsi is not None and setup_rsi < p["rsi_min"]
+          else f"RSI {rsi_txt} on the setup day is not under {p['rsi_max']}"),
+         setup_k is not None and setup_rsi is not None and p["rsi_min"] <= setup_rsi < p["rsi_max"]),
+        (f"Reversal: green close, RSI turning up, volume at least {p['min_rel_vol']:g}x average",
+         "no reversal yet: " + ", ".join(miss), trig["ok"]),
+        (f"Reward:risk at least 1:{p['rr']:g} to the 20-day average",
+         ("price is already at or above the 20-day average, so there is no room to the target"
+          if plan["rr"] <= 0 else f"target is only 1:{plan['rr']:.1f}, below your 1:{p['rr']:g} minimum"),
+         rr_ok),
         (f"No earnings within {p['earn_buffer']} days" + (" (date unknown)" if ed is None else ""),
          f"earnings in {ed} days (gap risk)",
          ed is None or not (0 <= ed <= p["earn_buffer"])),
@@ -522,25 +605,14 @@ def sidebar() -> dict:
         help="The most you're willing to lose if the stop is hit. The app works out how many shares "
              "to buy so that hitting the stop costs about this much. Shares = max loss ÷ (entry − stop).")
     p["rr"] = field(sb, "number_input", 
-        "🎯 Reward : risk (1 : x)", MIN_RR, 10.0, max(float(s["rr"]), MIN_RR), 0.5,
-        help="How much you aim to make for every $1 you risk. 1:2 means risk $35 to make $70. "
-             "1:2 is the minimum. Higher puts the target further away, so it gets hit less often.")
-    p["stop_mode"] = field(sb, "radio", 
-        "🛑 Stop based on", ["ATR", "Target %"], index=["ATR", "Target %"].index(s["stop_mode"]),
-        horizontal=True,
-        help="ATR = the stock's average daily move. 'ATR' puts the stop outside normal daily wiggles, "
-             "and the target follows from your reward:risk. 'Target %' lets you pick the rebound "
-             "(e.g. 4%) and the stop follows. Too tight a stop gets hit by noise.")
-    if p["stop_mode"] == "ATR":
-        p["atr_mult"] = field(sb, "number_input", 
-            "Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25,
-            help="1.5 means the stop sits 1.5 normal days' worth of movement below your entry.")
-        p["target_pct"] = float(s["target_pct"])
-    else:
-        p["target_pct"] = field(sb, "number_input", 
-            "Rebound target (%)", 1.0, 20.0, float(s["target_pct"]), 0.5,
-            help="How far up you expect the bounce to go. With 1:2, a 4% target means a 2% stop.")
-        p["atr_mult"] = float(s["atr_mult"])
+        "🎯 Minimum reward : risk (1 : x)", MIN_RR, MAX_RR, float(s["rr"]), 0.5,
+        help="The target is the 20-day average (the Bollinger middle band), where oversold stocks "
+             "often snap back to. A card fails if the trip from your entry to that target pays less "
+             "than this many dollars for every $1 of risk. 1:2 is the lowest you can set.")
+    p["atr_mult"] = field(sb, "number_input", 
+        "🛑 Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25,
+        help="ATR = the stock's average daily move. 1.5 means the stop sits 1.5 normal days' worth "
+             "of movement below your entry, outside ordinary daily wiggles.")
     p["max_hold"] = field(sb, "number_input", 
         "⏳ Max holding days", 1, 30, int(s["max_hold"]),
         help="If neither the stop nor the target is hit by this day, you exit anyway. "
@@ -587,12 +659,13 @@ def evaluate(row, p: dict, session: str) -> dict:
     ref = ref_price(row, session)
     news = fetch_news(t, str(row["description"]), 6)
     entry = st.session_state.get(f"entry_{t}", ref)
-    plan = build_plan(float(entry), float(row["ATR"]), p)
-    row = row.copy()
-    row["bb_dist_pct"] = 100 * (plan["entry"] / row["BB.lower"] - 1)
-    cks = checks(row, plan, news, p)
+    plan = build_plan(float(entry), float(row["ATR"]), float(row["SMA20"]), p)
+    setup_k = find_setup(row, p, session)
+    trig = trigger(row, p, session)
+    cks = checks(row, plan, news, p, session, setup_k, trig)
     failed = [why for _, why, ok in cks if not ok]
-    return {"row": row, "ref": ref, "news": news, "plan": plan, "cks": cks, "failed": failed}
+    return {"row": row, "ref": ref, "news": news, "plan": plan, "cks": cks, "failed": failed,
+            "setup_k": setup_k, "trig": trig}
 
 
 def tv_symbol(row) -> str:
@@ -625,9 +698,9 @@ TIPS = {
     "rsi": "RSI 0-100: how hard it's been sold lately. Under 30 = oversold. Under 15-20 = possible falling knife.",
     "vol": "Volume vs a normal day. 2x = twice the usual shares traded: a sign of panic selling.",
     "week": "Price change over the last 5 trading days. A deep weekly drop means the selling has been going on for a while, not just one bad day.",
-    "entry": "Suggested buy price (latest price, ~15 min delayed). 'max' = above this it's no longer at the lower band, so don't chase.",
+    "entry": "Suggested buy price (latest price, ~15 min delayed). 'max' = the highest price that still gives your minimum reward:risk, so don't chase above it.",
     "stop": "If the price falls to here, you sell. This caps the loss at about your max loss. Never move it lower once you're in.",
-    "target": "Take-profit price. It sits reward:risk times further above your entry than the stop sits below it (2x for 1:2).",
+    "target": "Take-profit at the 20-day average (the Bollinger middle band). Oversold stocks often snap back toward it.",
 }
 
 
@@ -636,13 +709,17 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     esc = html.escape
     rsi = float(row["RSI"])
     rsi_col = "var(--green)" if rsi < 30 else "var(--amber)" if rsi < 40 else "var(--muted)"
-    vol = float(row["relative_volume_10d_calc"])
+    vol = ev["trig"]["rel_vol"] or 0.0  # relative volume on the trigger (latest completed) session
     week = row["Perf.W"]
     week_txt = "n/a" if pd.isna(week) else f"{week:+.1f}%"
     chip = ('<span class="sw-chip no">⛔ Skip</span>' if failed
             else '<span class="sw-chip go">Worth a look</span>')
-    cut = 100 / (1 + p["rr"])
-    bb_line = row["BB.lower"] * p["bb_tol"]
+    rr = plan["rr"]
+    cut = min(max(100 / (1 + rr), 4), 96) if rr > 0 else 96
+    k = ev["setup_k"]
+    setup_txt = ("📍 No oversold setup in the last few sessions" if k is None else
+                 "📍 Setup in the latest session" if k == 0 else
+                 f"📍 Setup {k} session{'s' if k > 1 else ''} ago")
 
     tags = []
     if row["source"] == "premarket gap":
@@ -667,7 +744,8 @@ def card_html(ev: dict, p: dict, session: str) -> str:
   <div class="sw-top">
     <div><div class="sw-tkr"><a href="{tv_url(row)}" target="_blank">{esc(row['name'])}<span>↗</span></a></div>
          <div class="sw-co">{esc(str(row['description']))}</div>
-         <div class="sw-co">🏭 {esc(str(row['sector']))} › {esc(str(row['industry']))}</div></div>
+         <div class="sw-co">🏭 {esc(str(row['sector']))} › {esc(str(row['industry']))}</div>
+         <div class="sw-co">{setup_txt}</div></div>
     {chip}
   </div>
   <div class="sw-mini">
@@ -679,16 +757,16 @@ def card_html(ev: dict, p: dict, session: str) -> str:
   </div>
   <div class="sw-plan">
     <div class="e" data-tip="{TIPS['entry']}"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
-         <div class="d" style="color:var(--muted)">max {money(bb_line)}</div></div>
+         <div class="d" style="color:var(--muted)">max {money(plan['max_entry'])}</div></div>
     <div class="s" data-tip="{TIPS['stop']}"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
          <div class="d red">-{plan['stop_pct']:.1f}%</div></div>
     <div class="t" data-tip="{TIPS['target']}"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
-         <div class="d green">+{plan['target_pct']:.1f}%</div></div>
+         <div class="d {'green' if plan['target_pct'] > 0 else 'red'}">{plan['target_pct']:+.1f}%</div></div>
   </div>
   <div class="sw-ladder" style="--cut:{cut:.1f}%"><i></i></div>
   <div class="sw-foot">
     <span>🧮 <b>{plan['shares']}</b> shares · <b>{money(plan['position'])}</b></span>
-    <span>💸 risk <b>{money(plan['risk'])}</b> · 1:{p['rr']:g}</span>
+    <span>💸 risk <b>{money(plan['risk'])}</b> · <b>1:{max(rr, 0):.1f}</b></span>
     <span>⏳ exit by day <b>{p['max_hold']}</b></span>
   </div>
   {why}{tag_html}
@@ -824,23 +902,30 @@ def results(p: dict, session: str) -> list:
         st.success("😌 Nothing is oversold on heavy volume. No setup means no trade.")
         return []
     raw["ref"] = [ref_price(r, sess) for _, r in raw.iterrows()]
-    near = raw[(raw["ref"] <= raw["BB.lower"] * p["bb_tol"]) | (raw["source"] == "premarket gap")]
-    near = near.sort_values(["RSI", "relative_volume_10d_calc"], ascending=[True, False]).head(16)
+    # the band test belongs to the setup day, not today's price (the trigger day often closes back above it)
+    has_setup = [find_setup(r, p, sess) is not None for _, r in raw.iterrows()]
+    near = raw[pd.Series(has_setup, index=raw.index) | (raw["source"] == "premarket gap")]
+    near = near.assign(_trig=[trigger(r, p, sess)["ok"] for _, r in near.iterrows()])
+    n_trig = int((near["_trig"] & (near["source"] == "setup")).sum())
+    near = near.sort_values(["_trig", "RSI"], ascending=[False, True])
+    # top 16 setups, plus every premarket gap so the gap scan never gets crowded out
+    near = pd.concat([near[near["source"] == "setup"].head(16), near[near["source"] == "premarket gap"]])
     evs = [evaluate(row, p, sess) for _, row in near.iterrows()]
     good = [e for e in evs if not e["failed"]]
     skip = [e for e in evs if e["failed"]]
 
     st.markdown(stats_html([
-        (int((raw["source"] == "sell-off").sum()), "📉 Oversold on volume",
-         f"RSI under {p['rsi_max']} with at least {p['min_rel_vol']}x normal volume."),
-        (len(near), "🎯 At the lower band", "Of those, how many are at or below the lower Bollinger Band."),
+        (int((raw["source"] == "setup").sum()), "📉 Oversold setups",
+         f"Closed at or below the lower Bollinger Band with RSI under {p['rsi_max']} in the last few sessions."),
+        (n_trig, "🔄 Reversal triggered",
+         f"Of those, how many closed green with RSI turning up on at least {p['min_rel_vol']:g}x normal volume."),
         (len(good), "Worth a look", "Passed every automatic check. Still read the news before deciding."),
         (int((raw["source"] == "premarket gap").sum()), "🌙 Premarket gaps",
          f"Stocks down more than {abs(PREMARKET_GAP):g}% before the open (overnight shocks). Only during premarket."),
     ]), unsafe_allow_html=True)
 
     if not evs:
-        st.warning("Some stocks are oversold, but none are at the lower Bollinger Band. No trade today. 🧘")
+        st.warning("No stock closed at the lower Bollinger Band with a low RSI recently. No trade today. 🧘")
         return []
     if good:
         st.markdown('<div class="sw sw-section">Worth a look</div>', unsafe_allow_html=True)
