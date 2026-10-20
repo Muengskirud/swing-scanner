@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import swing_app as s  # noqa: E402
 
-P = dict(s.DEFAULTS)  # rsi_max 35, bb_tol 1.01, min_rel_vol 1.5, rr 2.0, atr_mult 1.5, max_risk 35
+P = dict(s.DEFAULTS)  # rsi_max 35, bb_tol 1.01, min_rel_vol 1.5, rr 3.0, atr_mult 1.5, max_risk 35
 
 
 def row(**kw):
@@ -38,31 +38,22 @@ def test_reward_risk_invalid_stop_is_zero():
     assert s.reward_risk(100, 100, 110) == 0.0
 
 
-def test_build_plan_uses_sma20_target_and_atr_stop():
-    plan = s.build_plan(100.0, 4.0, 115.0, P)  # stop = 100 - 1.5*4 = 94
+def test_build_plan_fixed_r_target_and_atr_stop():
+    plan = s.build_plan(100.0, 4.0, P)  # stop = 100 - 1.5*4 = 94, target = 100 + 3*6 = 118
     assert plan["stop"] == 94.0
-    assert plan["target"] == 115.0
-    assert plan["rr"] == pytest.approx(15 / 6)
-    assert plan["target_pct"] == 15.0
+    assert plan["target"] == 118.0
+    assert plan["rr"] == pytest.approx(3.0)
+    assert plan["target_pct"] == 18.0
     assert plan["shares"] == 5  # floor(35 / 6)
-    assert plan["max_entry"] == 103.0  # 115 - 2.0 * 6
 
 
-def test_rr_check_message_uses_live_minimum():
-    plan = s.build_plan(100.0, 4.0, 108.4, dict(P, rr=3.0))  # rr = 8.4 / 6 = 1.4
-    cks = s.checks(row(**{"RSI[1]": 30, "close[1]": 89}), plan, [], dict(P, rr=3.0), "closed", 1,
-                   {"ok": True, "above_open": True, "above_prev": True, "rsi_up": True, "volume": True,
-                    "rel_vol": 2.0, "green": True})
-    rr_line = [c for c in cks if c[0].startswith("Reward:risk")][0]
-    assert rr_line[0] == "Reward:risk at least 1:3 to the 20-day average"
-    assert rr_line[1] == "target is only 1:1.4, below your 1:3 minimum"
-    assert rr_line[2] is False
+def test_build_plan_follows_rr_setting():
+    plan = s.build_plan(100.0, 4.0, dict(P, rr=2.0))
+    assert plan["target"] == 112.0 and plan["rr"] == pytest.approx(2.0)
 
 
-def test_rr_check_passes_at_minimum():
-    plan = s.build_plan(100.0, 4.0, 112.0, P)  # exactly 1:2
-    assert plan["rr"] == pytest.approx(2.0)
-    assert plan["rr"] >= P["rr"] - 1e-9
+def test_swing_defaults_match_backtest_winner():
+    assert s.DEFAULTS["rr"] == 3.0 and s.DEFAULTS["max_hold"] == 25 and s.DEFAULTS["atr_mult"] == 1.5
 
 
 # ---------------------------------------------------------------- setup
@@ -170,14 +161,65 @@ NO_TRIG = {"ok": False, "above_open": False, "above_prev": False, "rsi_up": Fals
 
 
 def test_rsi_line_without_setup_says_so():
-    plan = s.build_plan(100.0, 4.0, 115.0, P)
+    plan = s.build_plan(100.0, 4.0, P)
     cks = s.checks(row(RSI=25), plan, [], P, "premarket", None, NO_TRIG)
     rsi_line = [c for c in cks if c[0].startswith("RSI between")][0]
     assert rsi_line[1] == "no setup day to check RSI on" and rsi_line[2] is False
 
 
 def test_rsi_floor_on_setup_day():
-    plan = s.build_plan(100.0, 4.0, 115.0, P)
+    plan = s.build_plan(100.0, 4.0, P)
     cks = s.checks(row(RSI=14, close=85), plan, [], P, "closed", 0, NO_TRIG)
     rsi_line = [c for c in cks if c[0].startswith("RSI between")][0]
     assert "below 20: falling-knife zone" in rsi_line[1] and rsi_line[2] is False
+
+
+
+# ---------------------------------------------------------------- position mode
+def fundamentals(**kw):
+    base = {"recommendation_mark": 1.4, "total_revenue_yoy_growth_ttm": 24.0,
+            "price_earnings_growth_ttm": 0.3, "free_cash_flow_margin_ttm": 28.0}
+    base.update(kw)
+    return pd.Series(base)
+
+
+def pos_line(cks, start):
+    return [c for c in cks if c[0].startswith(start)][0]
+
+
+def test_position_plan():
+    plan = s.position_plan(100.0, 160.0, P)  # 15% stop -> 85
+    assert plan["stop"] == 85.0 and plan["target"] == 160.0
+    assert plan["target_pct"] == 60.0
+    assert plan["rr"] == pytest.approx(4.0)
+    assert plan["shares"] == 2  # floor(35 / 15)
+
+
+def test_rating_label():
+    assert s.rating_label(1.1) == "Strong buy"
+    assert s.rating_label(2.0) == "Buy"
+    assert s.rating_label(3.0) == "Hold"
+    assert s.rating_label(None) == "no rating"
+
+
+def test_position_checks_pass_for_a_good_name():
+    plan = s.position_plan(100.0, 160.0, P)
+    assert all(ok for _, _, ok in s.position_checks(fundamentals(), plan, [], P))
+
+
+def test_position_checks_fail_reasons():
+    plan = s.position_plan(100.0, 110.0, P)
+    cks = s.position_checks(fundamentals(recommendation_mark=2.9, total_revenue_yoy_growth_ttm=3.0,
+                                         price_earnings_growth_ttm=None, free_cash_flow_margin_ttm=-5.0),
+                            plan, [], P)
+    assert pos_line(cks, "At least 20%")[1] == "only +10% to the analysts' target"
+    assert pos_line(cks, "Analysts rate")[1] == "analysts rate it Hold (2.9)"
+    assert pos_line(cks, "Revenue growing")[1] == "revenue only +3% a year"
+    assert pos_line(cks, "PEG")[1] == "PEG unknown (no earnings growth to measure)"
+    assert pos_line(cks, "Positive free cash flow")[1] == "burning cash (free cash flow margin -5%)"
+
+
+def test_position_peg_too_high():
+    plan = s.position_plan(100.0, 160.0, P)
+    cks = s.position_checks(fundamentals(price_earnings_growth_ttm=2.4), plan, [], P)
+    assert pos_line(cks, "PEG")[1] == "PEG 2.4: pricey for its growth" and pos_line(cks, "PEG")[2] is False

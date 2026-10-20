@@ -6,3 +6,5 @@ CLAUDE.md
 KICKOFF_PROMPT.md
 settings.json
 scans/
+research/cache.pkl
+research/trades_*.csv

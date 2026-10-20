@@ -34,7 +34,7 @@ HOSTED = os.environ.get("SWING_HOSTED") == "1" or HERE.startswith("/mount/src")
 ET_TZ = ZoneInfo("America/New_York")
 SG_TZ = ZoneInfo("Asia/Singapore")
 MIN_RR = 2.0  # strategy floor: never plan below 1:2
-MAX_RR = 5.0  # highest minimum reward:risk the sidebar allows
+MAX_RR = 5.0  # highest reward:risk the sidebar allows
 SETUP_LOOKBACK = 3  # setup must appear in the last 3 completed sessions
 MAX_BARS_BACK = 2  # TradingView serves field[1] and field[2]; field[3] comes back empty (checked 2026-10-20)
 PREMARKET_GAP = -3.0  # premarket move (%) that counts as an overnight shock
@@ -50,8 +50,21 @@ COLUMNS = [
     "open", "SMA20", "open[1]", "close[1]", "close[2]", "RSI[1]", "RSI[2]",
     "BB.lower[1]", "BB.lower[2]", "relative_volume_10d_calc[1]",
 ]
+POS_COLUMNS = [
+    "name", "description", "close", "change", "sector", "industry", "market_cap_basic", "ATR",
+    "SMA200", "Perf.W", "Perf.Y", "price_52_week_high", "price_52_week_low",
+    "price_target_average", "price_target_high", "price_target_low",
+    "recommendation_mark", "recommendation_buy", "recommendation_total",
+    "total_revenue_yoy_growth_ttm", "earnings_per_share_diluted_yoy_growth_ttm",
+    "price_earnings_ttm", "price_earnings_growth_ttm", "earnings_per_share_forecast_next_fy",
+    "free_cash_flow_margin_ttm", "gross_margin_ttm", "debt_to_equity_fq",
+    "earnings_release_next_date", "earnings_release_date", "premarket_close", "premarket_change",
+]
 DEFAULTS = {
-    "layman": False, "max_risk": 35, "rr": 2.0, "atr_mult": 1.5, "max_hold": 7,
+    "mode": "Swing", "layman": False, "max_risk": 35, "rr": 3.0, "atr_mult": 1.5, "max_hold": 25,
+    # position mode
+    "pos_upside": 20, "pos_rating": 2.0, "pos_analysts": 5, "pos_rev_growth": 10.0, "pos_peg": 1.5,
+    "pos_stop_pct": 15.0,
     "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_min": 20, "rsi_max": 35,
     "min_rel_vol": 1.5, "bb_tol": 1.01, "earn_buffer": 7,
 }
@@ -241,18 +254,18 @@ def reward_risk(entry: float, stop: float, target: float) -> float:
     return (target - entry) / (entry - stop) if entry > stop else 0.0
 
 
-def build_plan(entry: float, atr: float, target: float, p: dict) -> dict:
-    """Stop = entry - ATR multiple; target = the 20-day average (Bollinger middle band);
+def build_plan(entry: float, atr: float, p: dict) -> dict:
+    """Stop = entry - ATR multiple; target = entry + reward:risk x stop distance (3R by default,
+    the best combination in the 2019-2026 backtest, paired with a 25-day max hold);
     shares = max loss / (entry - stop)."""
     stop_dist = p["atr_mult"] * atr
     shares = math.floor(p["max_risk"] / stop_dist) if stop_dist > 0 else 0
-    stop = entry - stop_dist
+    stop, target = entry - stop_dist, entry + p["rr"] * stop_dist
     return {
         "entry": round(entry, 2),
         "stop": round(stop, 2),
         "target": round(target, 2),
         "rr": reward_risk(entry, stop, target),
-        "max_entry": round(target - p["rr"] * stop_dist, 2),  # highest entry that still meets the minimum
         "stop_dist": stop_dist,
         "stop_pct": round(100 * stop_dist / entry, 2) if entry else 0,
         "target_pct": round(100 * (target - entry) / entry, 2) if entry else 0,
@@ -279,7 +292,6 @@ def checks(row, plan, news, p, session: str, setup_k, trig: dict) -> list:
     rsi_txt = "unknown" if setup_rsi is None else f"{setup_rsi:.0f}"
     look = min(SETUP_LOOKBACK, MAX_BARS_BACK + 1 - o)
     miss = trigger_failures(trig, p)
-    rr_ok = plan["rr"] >= p["rr"] - 1e-9
     return [
         (f"Setup: closed at or below the lower Bollinger Band with RSI under {p['rsi_max']} "
          f"(last {look} sessions)",
@@ -293,13 +305,73 @@ def checks(row, plan, news, p, session: str, setup_k, trig: dict) -> list:
          setup_k is not None and setup_rsi is not None and p["rsi_min"] <= setup_rsi < p["rsi_max"]),
         (f"Reversal: green close, RSI turning up, volume at least {p['min_rel_vol']:g}x average",
          "no reversal yet: " + ", ".join(miss), trig["ok"]),
-        (f"Reward:risk at least 1:{p['rr']:g} to the 20-day average",
-         ("price is already at or above the 20-day average, so there is no room to the target"
-          if plan["rr"] <= 0 else f"target is only 1:{plan['rr']:.1f}, below your 1:{p['rr']:g} minimum"),
-         rr_ok),
         (f"No earnings within {p['earn_buffer']} days" + (" (date unknown)" if ed is None else ""),
          f"earnings in {ed} days (gap risk)",
          ed is None or not (0 <= ed <= p["earn_buffer"])),
+        ("No severe red-flag headline", "severe red-flag headline", "severe" not in levels),
+        ("At least 1 share fits your max loss",
+         f"stop is wider than your ${p['max_risk']:g} max loss", plan["shares"] >= 1),
+    ]
+
+
+# ---------------------------------------------------------------- position mode
+def scan_position(p: dict) -> pd.DataFrame:
+    """Analyst-covered stocks trading below the analysts' average price target."""
+    q = (Query().set_markets("america").select(*POS_COLUMNS)
+         .where(*_base_filters(p), col("recommendation_total") >= p["pos_analysts"],
+                col("price_target_average") > col("close"))
+         .limit(3000))
+    _, df = q.get_scanner_data()
+    df["source"] = "position"
+    return df
+
+
+def rating_label(mark) -> str:
+    """TradingView's analyst score runs from 1 (strong buy) to 5 (strong sell)."""
+    if mark is None or pd.isna(mark):
+        return "no rating"
+    return ("Strong buy" if mark <= 1.5 else "Buy" if mark <= 2.5 else "Hold" if mark <= 3.5
+            else "Sell" if mark <= 4.5 else "Strong sell")
+
+
+def position_plan(entry: float, target: float, p: dict) -> dict:
+    """Target = analysts' average price target. Stop = a fixed % below entry.
+    Shares = max loss / (entry - stop)."""
+    stop = entry * (1 - p["pos_stop_pct"] / 100)
+    dist = entry - stop
+    shares = math.floor(p["max_risk"] / dist) if dist > 0 else 0
+    return {
+        "entry": round(entry, 2), "stop": round(stop, 2), "target": round(target, 2),
+        "rr": reward_risk(entry, stop, target),
+        "stop_pct": round(100 * dist / entry, 2) if entry else 0,
+        "target_pct": round(100 * (target - entry) / entry, 2) if entry else 0,
+        "shares": shares, "position": round(shares * entry, 2), "risk": round(shares * dist, 2),
+    }
+
+
+def position_checks(row, plan, news, p) -> list:
+    """Fundamental pre-checks for a position trade, in the same (label, failure, ok) shape."""
+    mark = bar(row, "recommendation_mark", 0)
+    rev = bar(row, "total_revenue_yoy_growth_ttm", 0)
+    peg = bar(row, "price_earnings_growth_ttm", 0)
+    fcf = bar(row, "free_cash_flow_margin_ttm", 0)
+    levels = [x["level"] for x in news]
+    return [
+        (f"At least {p['pos_upside']:g}% below the analysts' average target",
+         f"only {plan['target_pct']:+.0f}% to the analysts' target", plan["target_pct"] >= p["pos_upside"]),
+        (f"Analysts rate it {rating_label(p['pos_rating'])} or better (score {p['pos_rating']:g} or lower)",
+         ("no analyst rating" if mark is None else f"analysts rate it {rating_label(mark)} ({mark:.1f})"),
+         mark is not None and mark <= p["pos_rating"]),
+        (f"Revenue growing at least {p['pos_rev_growth']:g}% a year (demand)",
+         ("revenue growth unknown" if rev is None else f"revenue only {rev:+.0f}% a year"),
+         rev is not None and rev >= p["pos_rev_growth"]),
+        (f"PEG {p['pos_peg']:g} or lower (cheap for its growth)",
+         ("PEG unknown (no earnings growth to measure)" if peg is None or peg <= 0
+          else f"PEG {peg:.1f}: pricey for its growth"),
+         peg is not None and 0 < peg <= p["pos_peg"]),
+        ("Positive free cash flow",
+         ("free cash flow unknown" if fcf is None else f"burning cash (free cash flow margin {fcf:.0f}%)"),
+         fcf is not None and fcf > 0),
         ("No severe red-flag headline", "severe red-flag headline", "severe" not in levels),
         ("At least 1 share fits your max loss",
          f"stop is wider than your ${p['max_risk']:g} max loss", plan["shares"] >= 1),
@@ -600,51 +672,92 @@ def sidebar() -> dict:
 [data-tip] { cursor: inherit !important; }
 .sw-q, .sw-float { display: none !important; }
 </style>""", unsafe_allow_html=True)
+    pick = sb.segmented_control("Mode", ["⚡ Swing", "🏔️ Position"], key="mode_pick",
+                                default="🏔️ Position" if s["mode"] == "Position" else "⚡ Swing",
+                                label_visibility="collapsed", width="stretch")
+    p["mode"] = "Position" if pick and "Position" in pick else "Swing"
     p["max_risk"] = field(sb, "number_input", 
         "💸 Max loss per trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0,
         help="The most you're willing to lose if the stop is hit. The app works out how many shares "
              "to buy so that hitting the stop costs about this much. Shares = max loss ÷ (entry − stop).")
-    p["rr"] = field(sb, "number_input", 
-        "🎯 Minimum reward : risk (1 : x)", MIN_RR, MAX_RR, float(s["rr"]), 0.5,
-        help="The target is the 20-day average (the Bollinger middle band), where oversold stocks "
-             "often snap back to. A card fails if the trip from your entry to that target pays less "
-             "than this many dollars for every $1 of risk. 1:2 is the lowest you can set.")
-    p["atr_mult"] = field(sb, "number_input", 
-        "🛑 Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25,
-        help="ATR = the stock's average daily move. 1.5 means the stop sits 1.5 normal days' worth "
-             "of movement below your entry, outside ordinary daily wiggles.")
-    p["max_hold"] = field(sb, "number_input", 
-        "⏳ Max holding days", 1, 30, int(s["max_hold"]),
-        help="If neither the stop nor the target is hit by this day, you exit anyway. "
-             "Stops you holding a trade just because it hasn't recovered.")
-    with sb.expander("🔎 Scan filters"):
-        p["rsi_min"], p["rsi_max"] = field(st, "slider", 
-            "🌡️ RSI range", 5, 50, (int(s["rsi_min"]), int(s["rsi_max"])),
-            help="RSI (0-100) measures how hard a stock has been sold or bought lately. Under 30 = "
-                 "oversold (sellers exhausted). Under about 15-20 often means real bad news, "
-                 "a 'falling knife'. Stocks below the lower number still show, under Skipped.")
-        p["bb_tol"] = 1 + field(st, "slider", 
-            "📏 Lower-band tolerance (%)", 0.0, 5.0, round((float(s["bb_tol"]) - 1) * 100, 1), 0.5,
-            help="The lower Bollinger Band marks 'unusually far below the 20-day average'. 0% = price "
-                 "must touch or break below the band. 1% = within 1% above it also counts.") / 100
-        p["min_rel_vol"] = field(st, "slider", 
-            "🔊 Min relative volume (x)", 1.0, 5.0, float(s["min_rel_vol"]), 0.1,
-            help="Today's trading volume compared with a normal day. 1.5x = 50% more shares traded "
-                 "than usual, a sign of panic or forced selling rather than a quiet drift.")
-        p["min_mcap_b"] = field(st, "number_input", 
-            "🏢 Min market cap (USD B)", 0.1, 500.0, float(s["min_mcap_b"]), 0.5,
-            help="Company size (share price × shares). Bigger companies are less likely to collapse "
-                 "for good after a bad day.")
-        p["min_price"] = field(st, "number_input", 
-            "💲 Min share price", 1.0, 500.0, float(s["min_price"]), 1.0,
-            help="Skips very cheap 'penny' stocks, which jump around wildly.")
-        p["min_avg_vol"] = field(st, "number_input", 
-            "💧 Min avg daily volume (shares)", 100_000, 50_000_000, int(s["min_avg_vol"]), 100_000,
-            help="Liquidity. Busy stocks are easy to buy and sell near the price you see.")
-        p["earn_buffer"] = field(st, "number_input", 
-            "📣 Earnings buffer (days)", 0, 30, int(s["earn_buffer"]),
-            help="Skips stocks reporting earnings within this many days. Earnings can make a stock "
-                 "jump past your stop overnight.")
+    if p["mode"] == "Swing":
+        p["rr"] = field(sb, "number_input", 
+            "🎯 Reward : risk target (1 : x)", MIN_RR, MAX_RR, float(s["rr"]), 0.5,
+            help="Target = entry + this many times the stop distance. 1:3 means risk $35 to aim for "
+                 "$105. In the 2019-2026 backtest, 1:3 with a 25-day max hold did best. "
+                 "1:2 is the lowest you can set.")
+        p["atr_mult"] = field(sb, "number_input", 
+            "🛑 Stop distance (x ATR)", 0.25, 4.0, float(s["atr_mult"]), 0.25,
+            help="ATR = the stock's average daily move. 1.5 means the stop sits 1.5 normal days' worth "
+                 "of movement below your entry, outside ordinary daily wiggles.")
+        p["max_hold"] = field(sb, "number_input", 
+            "⏳ Max holding days", 1, 60, int(s["max_hold"]),
+            help="If neither the stop nor the target is hit by this day, you exit anyway. "
+                 "Stops you holding a trade just because it hasn't recovered.")
+        with sb.expander("🔎 Scan filters"):
+            p["rsi_min"], p["rsi_max"] = field(st, "slider", 
+                "🌡️ RSI range", 5, 50, (int(s["rsi_min"]), int(s["rsi_max"])),
+                help="RSI (0-100) measures how hard a stock has been sold or bought lately. Under 30 = "
+                     "oversold (sellers exhausted). Under about 15-20 often means real bad news, "
+                     "a 'falling knife'. Stocks below the lower number still show, under Skipped.")
+            p["bb_tol"] = 1 + field(st, "slider", 
+                "📏 Lower-band tolerance (%)", 0.0, 5.0, round((float(s["bb_tol"]) - 1) * 100, 1), 0.5,
+                help="The lower Bollinger Band marks 'unusually far below the 20-day average'. 0% = price "
+                     "must touch or break below the band. 1% = within 1% above it also counts.") / 100
+            p["min_rel_vol"] = field(st, "slider", 
+                "🔊 Min relative volume (x)", 1.0, 5.0, float(s["min_rel_vol"]), 0.1,
+                help="Today's trading volume compared with a normal day. 1.5x = 50% more shares traded "
+                     "than usual, a sign of panic or forced selling rather than a quiet drift.")
+            p["min_mcap_b"] = field(st, "number_input", 
+                "🏢 Min market cap (USD B)", 0.1, 500.0, float(s["min_mcap_b"]), 0.5,
+                help="Company size (share price × shares). Bigger companies are less likely to collapse "
+                     "for good after a bad day.")
+            p["min_price"] = field(st, "number_input", 
+                "💲 Min share price", 1.0, 500.0, float(s["min_price"]), 1.0,
+                help="Skips very cheap 'penny' stocks, which jump around wildly.")
+            p["min_avg_vol"] = field(st, "number_input", 
+                "💧 Min avg daily volume (shares)", 100_000, 50_000_000, int(s["min_avg_vol"]), 100_000,
+                help="Liquidity. Busy stocks are easy to buy and sell near the price you see.")
+            p["earn_buffer"] = field(st, "number_input", 
+                "📣 Earnings buffer (days)", 0, 30, int(s["earn_buffer"]),
+                help="Skips stocks reporting earnings within this many days. Earnings can make a stock "
+                     "jump past your stop overnight.")
+    else:
+        p["pos_stop_pct"] = field(sb, "number_input", 
+            "🛑 Stop loss (% below entry)", 3.0, 50.0, float(s["pos_stop_pct"]), 1.0,
+            help="Position trades are held for months, so the stop sits further away than a swing stop. "
+                 "15% means you sell if it falls 15% from your entry. Wider stop = fewer shares.")
+        with sb.expander("🔎 Value filters"):
+            p["pos_upside"] = field(st, "slider", 
+                "🎯 Min upside to analyst target (%)", 0, 100, int(s["pos_upside"]), 5,
+                help="How far below the analysts' average 12-month price target the stock must trade. "
+                     "Analyst targets are opinions and often too optimistic, so leave a margin.")
+            p["pos_rating"] = field(st, "slider", 
+                "🏦 Max analyst score (1 = strong buy)", 1.0, 3.5, float(s["pos_rating"]), 0.1,
+                help="The average analyst recommendation: 1 strong buy, 2 buy, 3 hold, 4 sell, 5 strong sell. "
+                     "2.0 keeps stocks rated Buy or better.")
+            p["pos_analysts"] = field(st, "number_input", 
+                "👥 Min number of analysts", 1, 50, int(s["pos_analysts"]),
+                help="A target from 2 analysts means little. More analysts = a more reliable consensus.")
+            p["pos_rev_growth"] = field(st, "slider", 
+                "📈 Min revenue growth (% a year)", -20.0, 60.0, float(s["pos_rev_growth"]), 1.0,
+                help="Demand check: how much sales grew over the last 12 months versus the year before.")
+            p["pos_peg"] = field(st, "slider", 
+                "⚖️ Max PEG ratio", 0.25, 5.0, float(s["pos_peg"]), 0.25,
+                help="P/E divided by earnings growth. Under 1 = cheap for how fast profits grow, "
+                     "1-2 = fair, over 2 = you're paying a lot for the growth.")
+            p["min_mcap_b"] = field(st, "number_input", 
+                "🏢 Min market cap (USD B)", 0.1, 500.0, float(s["min_mcap_b"]), 0.5,
+                help="Company size (share price × shares). Bigger companies are less likely to collapse "
+                     "for good after a bad day.")
+            p["min_price"] = field(st, "number_input", 
+                "💲 Min share price", 1.0, 500.0, float(s["min_price"]), 1.0,
+                help="Skips very cheap 'penny' stocks, which jump around wildly.")
+            p["min_avg_vol"] = field(st, "number_input", 
+                "💧 Min avg daily volume (shares)", 100_000, 50_000_000, int(s["min_avg_vol"]), 100_000,
+                help="Liquidity. Busy stocks are easy to buy and sell near the price you see.")
+    for k, v in s.items():  # keep the other mode's settings so saving defaults keeps them too
+        p.setdefault(k, v)
     if not HOSTED and sb.button("💾 Save as my defaults", width="stretch"):
         save_settings(p)
         sb.success("Saved.")
@@ -658,8 +771,8 @@ def evaluate(row, p: dict, session: str) -> dict:
     t = row["name"]
     ref = ref_price(row, session)
     news = fetch_news(t, str(row["description"]), 6)
-    entry = st.session_state.get(f"entry_{t}", ref)
-    plan = build_plan(float(entry), float(row["ATR"]), float(row["SMA20"]), p)
+    entry = st.session_state.get(f"entry_Swing_{t}", ref)
+    plan = build_plan(float(entry), float(row["ATR"]), p)
     setup_k = find_setup(row, p, session)
     trig = trigger(row, p, session)
     cks = checks(row, plan, news, p, session, setup_k, trig)
@@ -698,9 +811,9 @@ TIPS = {
     "rsi": "RSI 0-100: how hard it's been sold lately. Under 30 = oversold. Under 15-20 = possible falling knife.",
     "vol": "Volume vs a normal day. 2x = twice the usual shares traded: a sign of panic selling.",
     "week": "Price change over the last 5 trading days. A deep weekly drop means the selling has been going on for a while, not just one bad day.",
-    "entry": "Suggested buy price (latest price, ~15 min delayed). 'max' = the highest price that still gives your minimum reward:risk, so don't chase above it.",
+    "entry": "Suggested buy price (latest price, ~15 min delayed). Below it: how much this stock normally moves in a day (ATR).",
     "stop": "If the price falls to here, you sell. This caps the loss at about your max loss. Never move it lower once you're in.",
-    "target": "Take-profit at the 20-day average (the Bollinger middle band). Oversold stocks often snap back toward it.",
+    "target": "Take-profit price: your reward:risk times the stop distance above your entry (3x by default).",
 }
 
 
@@ -728,8 +841,6 @@ def card_html(ev: dict, p: dict, session: str) -> str:
     atr_pct = 100 * row["ATR"] / row["close"]
     if plan["stop_atr"] < 0.75:
         tags.append(f"🌊 Stop is inside daily noise ({atr_pct:.1f}%/day)")
-    if plan["target_pct"] > 5:
-        tags.append(f"🚀 Target +{plan['target_pct']:.1f}% is a big ask")
     last = days_from_now(row["earnings_release_date"])
     if last is not None and -4 <= last <= 0:
         tags.append("📣 Drop follows earnings, read the report")
@@ -757,7 +868,7 @@ def card_html(ev: dict, p: dict, session: str) -> str:
   </div>
   <div class="sw-plan">
     <div class="e" data-tip="{TIPS['entry']}"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
-         <div class="d" style="color:var(--muted)">max {money(plan['max_entry'])}</div></div>
+         <div class="d" style="color:var(--muted)">moves {atr_pct:.1f}%/day</div></div>
     <div class="s" data-tip="{TIPS['stop']}"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
          <div class="d red">-{plan['stop_pct']:.1f}%</div></div>
     <div class="t" data-tip="{TIPS['target']}"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
@@ -773,15 +884,101 @@ def card_html(ev: dict, p: dict, session: str) -> str:
 </div>"""
 
 
-def render_candidate(ev: dict, p: dict, session: str):
+TIPS_POS = {
+    "upside": "How far the price is below the analysts' average 12-month target. Targets are opinions, often optimistic.",
+    "rating": "Average analyst recommendation: 1 strong buy, 2 buy, 3 hold, 4 sell, 5 strong sell.",
+    "rev": "Revenue growth over the last 12 months versus the year before: is demand growing?",
+    "peg": "P/E divided by earnings growth. Under 1 = cheap for its growth, 1-2 fair, over 2 pricey.",
+    "entry": "Suggested buy price (latest price, ~15 min delayed). Below it: the 52-week high for context.",
+    "stop": "If it falls this far below your entry, you sell. Caps the loss at about your max loss.",
+    "target": "The analysts' average 12-month price target. Below it: the lowest and highest analyst targets.",
+}
+
+
+def evaluate_position(row, p: dict, session: str) -> dict:
+    t = row["name"]
+    ref = ref_price(row, session)
+    news = fetch_news(t, str(row["description"]), 6)
+    entry = st.session_state.get(f"entry_Position_{t}", ref)
+    plan = position_plan(float(entry), float(row["price_target_average"]), p)
+    cks = position_checks(row, plan, news, p)
+    failed = [why for _, why, ok in cks if not ok]
+    return {"row": row, "ref": ref, "news": news, "plan": plan, "cks": cks, "failed": failed}
+
+
+def position_card_html(ev: dict, p: dict, session: str) -> str:
+    row, plan, failed = ev["row"], ev["plan"], ev["failed"]
+    esc = html.escape
+    num = lambda f: bar(row, f, 0)  # noqa: E731
+    mark, rev, peg = num("recommendation_mark"), num("total_revenue_yoy_growth_ttm"), num("price_earnings_growth_ttm")
+    pe, eps_fwd, fcf, de = (num("price_earnings_ttm"), num("earnings_per_share_forecast_next_fy"),
+                            num("free_cash_flow_margin_ttm"), num("debt_to_equity_fq"))
+    hi52, lo_t, hi_t = num("price_52_week_high"), num("price_target_low"), num("price_target_high")
+    buys, total = num("recommendation_buy"), num("recommendation_total")
+    fwd_pe = plan["entry"] / eps_fwd if eps_fwd and eps_fwd > 0 else None
+    up = plan["target_pct"]
+    chip = ('<span class="sw-chip no">⛔ Skip</span>' if failed
+            else '<span class="sw-chip go">Worth a look</span>')
+    rr = plan["rr"]
+    cut = min(max(100 / (1 + rr), 4), 96) if rr > 0 else 96
+    fmt = lambda v, f: "n/a" if v is None else f.format(v)  # noqa: E731
+    facts = " · ".join([f"P/E {fmt(pe, '{:.1f}')}", f"fwd P/E {fmt(fwd_pe, '{:.1f}')}",
+                        f"FCF margin {fmt(fcf, '{:.0f}%')}", f"debt/equity {fmt(de, '{:.2f}')}"])
+    tags = []
+    ed = days_from_now(row["earnings_release_next_date"])
+    if ed is not None and 0 <= ed <= 14:
+        tags.append(f"📣 Earnings in {ed} days")
+    if hi52:
+        tags.append(f"📉 {100 * (1 - plan['entry'] / hi52):.0f}% below its 52-week high")
+    if row["SMA200"] and row["close"] < row["SMA200"]:
+        tags.append("📉 Below 200-day average")
+    why = f'<div class="sw-why">⛔ {esc("; ".join(failed))}</div>' if failed else ""
+    tag_html = ('<div class="sw-tags">' + "".join(f'<span class="sw-tag">{esc(t)}</span>' for t in tags)
+                + "</div>") if tags else ""
+    return f"""
+<div class="sw sw-card {'skip' if failed else ''}">
+  <div class="sw-top">
+    <div><div class="sw-tkr"><a href="{tv_url(row)}" target="_blank">{esc(row['name'])}<span>↗</span></a></div>
+         <div class="sw-co">{esc(str(row['description']))}</div>
+         <div class="sw-co">🏭 {esc(str(row['sector']))} › {esc(str(row['industry']))}</div>
+         <div class="sw-co">🧾 {esc(facts)}</div></div>
+    {chip}
+  </div>
+  <div class="sw-mini">
+    <div data-tip="{TIPS_POS['upside']}"><div class="k">Upside</div><div class="v {'green' if up > 0 else 'red'}">{up:+.0f}%</div></div>
+    <div data-tip="{TIPS_POS['rating']}"><div class="k">Analysts</div><div class="v">{esc(rating_label(mark))}</div></div>
+    <div data-tip="{TIPS_POS['rev']}"><div class="k">Revenue</div><div class="v {'green' if rev and rev > 0 else 'red'}">{fmt(rev, '{:+.0f}%')}</div></div>
+    <div data-tip="{TIPS_POS['peg']}"><div class="k">PEG</div><div class="v">{fmt(peg, '{:.2f}')}</div></div>
+  </div>
+  <div class="sw-plan">
+    <div class="e" data-tip="{TIPS_POS['entry']}"><div class="k">🎯 ENTRY</div><div class="v">{money(plan['entry'])}</div>
+         <div class="d" style="color:var(--muted)">52w high {fmt(hi52, '${:,.2f}')}</div></div>
+    <div class="s" data-tip="{TIPS_POS['stop']}"><div class="k">🛑 STOP</div><div class="v">{money(plan['stop'])}</div>
+         <div class="d red">-{plan['stop_pct']:.1f}%</div></div>
+    <div class="t" data-tip="{TIPS_POS['target']}"><div class="k">🏁 TARGET</div><div class="v">{money(plan['target'])}</div>
+         <div class="d" style="color:var(--muted)">{fmt(lo_t, '${:,.0f}')} to {fmt(hi_t, '${:,.0f}')}</div></div>
+  </div>
+  <div class="sw-ladder" style="--cut:{cut:.1f}%"><i></i></div>
+  <div class="sw-foot">
+    <span>🧮 <b>{plan['shares']}</b> shares · <b>{money(plan['position'])}</b></span>
+    <span>💸 risk <b>{money(plan['risk'])}</b> · <b>1:{max(rr, 0):.1f}</b></span>
+    <span>👥 <b>{fmt(buys, '{:.0f}')}</b> of {fmt(total, '{:.0f}')} analysts say buy</span>
+  </div>
+  {why}{tag_html}
+</div>"""
+
+
+def render_candidate(ev: dict, p: dict, session: str, mode: str = "Swing"):
     row = ev["row"]
     t = row["name"]
-    st.markdown(card_html(ev, p, session), unsafe_allow_html=True)
-    with st.expander(f"📈 Chart  ·  📰 why did {t} drop?  ·  ✅ checks"):
-        if st.toggle("📈 Show live chart (Bollinger Bands + RSI)", key=f"chart_{t}"):
+    swing = mode == "Swing"
+    st.markdown((card_html if swing else position_card_html)(ev, p, session), unsafe_allow_html=True)
+    title = f"📈 Chart  ·  📰 why did {t} drop?  ·  ✅ checks" if swing else f"📈 Chart  ·  📰 {t} news  ·  ✅ checks"
+    with st.expander(title):
+        if st.toggle("📈 Show live chart (Bollinger Bands + RSI)", key=f"chart_{mode}_{t}"):
             components.html(chart_widget(row), height=465)
         st.number_input("✏️ Your entry price (plan recalculates)", 0.01, 100_000.0,
-                        float(round(ev["ref"], 2)), 0.01, key=f"entry_{t}")
+                        float(round(ev["ref"], 2)), 0.01, key=f"entry_{mode}_{t}")
         news_html = "".join(
             f'<div class="sw-news">{ {"severe": "🔴 ", "caution": "🟡 ", "error": "⚠️ "}.get(n["level"], "🗞️ ")}'
             + (f'<a href="{html.escape(n["link"])}" target="_blank">{html.escape(n["title"])}</a>' if n["link"]
@@ -789,7 +986,9 @@ def render_candidate(ev: dict, p: dict, session: str):
             + f'<div class="src">{html.escape(n["source"])} · {html.escape(n["published"])}</div></div>'
             for n in ev["news"])
         st.markdown(news_html, unsafe_allow_html=True)
-        st.caption("🔴 🟡 are keyword flags, not a judgment. Is this emotion, or the business changing?")
+        st.caption("🔴 🟡 are keyword flags, not a judgment. " + (
+            "Is this emotion, or the business changing?" if swing
+            else "Is demand real, and is the story behind the analysts' target still intact?"))
         st.markdown("".join(f'<div class="sw-check">{"✅" if ok else "❌"} {html.escape(label)}</div>'
                             for label, _, ok in ev["cks"]), unsafe_allow_html=True)
 
@@ -822,7 +1021,13 @@ def fear_greed_html() -> str:
 </div>"""
 
 
-def hero_html(session: str, picks: list) -> str:
+SUBTITLES = {
+    "Swing": "Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.",
+    "Position": "Growing companies trading below what analysts think they're worth. Buy value, hold for the story.",
+}
+
+
+def hero_html(session: str, picks: list, mode: str = "Swing") -> str:
     now_et = datetime.now(ET_TZ)
     label, target = next_session_event()
     cls = {"open": "live", "premarket": "pre", "after hours": "pre"}.get(session, "off")
@@ -836,14 +1041,15 @@ def hero_html(session: str, picks: list) -> str:
         ticks += [f'<b>{html.escape(t)}</b> <span class="{"red" if c < 0 else "green"}">'
                   f'{"▼" if c < 0 else "▲"} {abs(c):.1f}%</span>' for t, c in picks]
     else:
-        ticks.append('🎯 Lower band <b>·</b> RSI <b>·</b> volume <b>·</b> news')
+        ticks.append('🎯 Lower band <b>·</b> RSI <b>·</b> volume <b>·</b> news' if mode == "Swing"
+                     else '🏦 Fair value <b>·</b> growth <b>·</b> analysts <b>·</b> news')
     items = "".join(f'<span class="sw-tick">{x}</span>' for x in ticks)
     reps = max(2, -(-8 // len(ticks)))  # each half of the loop must be wider than the strip
     return f"""
 <div class="sw sw-hero"><div>
   <div class="sw-bless">May God bless this trade. Amen ✝️</div>
   <h1>📉 SkimTrade</h1>
-  <div class="sub">Find oversold rebounds after emotional sell-offs. Buy the panic, not the problem.</div>
+  <div class="sub">{SUBTITLES[mode]}</div>
   </div>
   {fear_greed_html()}
   <div class="sw-tape">
@@ -865,12 +1071,13 @@ def main():
     components.html(TIP_JS, height=0)
     p = sidebar()
     session = market_session()
+    mode, pk = p["mode"], f"picks_{p['mode']}"
     hero_slot = st.empty()  # drawn now with the last picks, redrawn once this run's scan is known
-    hero_slot.markdown(hero_html(session, st.session_state.get("picks", [])), unsafe_allow_html=True)
-    picks = results(p, session)
-    if picks != st.session_state.get("picks", []):
-        st.session_state["picks"] = picks
-        hero_slot.markdown(hero_html(session, picks), unsafe_allow_html=True)
+    hero_slot.markdown(hero_html(session, st.session_state.get(pk, []), mode), unsafe_allow_html=True)
+    picks = (results if mode == "Swing" else results_position)(p, session)
+    if picks != st.session_state.get(pk, []):
+        st.session_state[pk] = picks
+        hero_slot.markdown(hero_html(session, picks, mode), unsafe_allow_html=True)
 
 
 def results(p: dict, session: str) -> list:
@@ -882,13 +1089,13 @@ def results(p: dict, session: str) -> list:
     if run:
         with st.spinner("Scanning the market for panic sells..."):
             try:
-                st.session_state["raw"] = run_scan(p, session)
-                st.session_state["session"] = session
+                st.session_state["raw_Swing"] = run_scan(p, session)
+                st.session_state["session_Swing"] = session
             except Exception as e:
-                st.session_state.pop("raw", None)
+                st.session_state.pop("raw_Swing", None)
                 st.error(f"Scan failed: {type(e).__name__}: {e}")
 
-    if "raw" not in st.session_state:
+    if "raw_Swing" not in st.session_state:
         st.markdown(stats_html([("👆", "Press scan to start", ""),
                                 ("🎯", "1:" + f"{p['rr']:g}" + " reward:risk", ""),
                                 ("💸", f"${p['max_risk']:g} max loss", ""),
@@ -896,8 +1103,8 @@ def results(p: dict, session: str) -> list:
                     unsafe_allow_html=True)
         return []
 
-    raw = st.session_state["raw"].copy()
-    sess = st.session_state["session"]
+    raw = st.session_state["raw_Swing"].copy()
+    sess = st.session_state["session_Swing"]
     if raw.empty:
         st.success("😌 Nothing is oversold on heavy volume. No setup means no trade.")
         return []
@@ -939,6 +1146,62 @@ def results(p: dict, session: str) -> list:
             for i, e in enumerate(skip):
                 with cols[i % 2]:
                     render_candidate(e, p, sess)
+    return [(str(e["row"]["name"]), float(e["row"]["change"])) for e in good]
+
+
+def results_position(p: dict, session: str) -> list:
+    """Position mode: scan button, stats and value cards."""
+    c1, c2 = st.columns([2, 1])
+    c1.markdown('<div class="sw sw-rule">Rule: <b>Don&#39;t be greedy</b></div>', unsafe_allow_html=True)
+    if c2.button("🔍 Scan for value", type="primary", width="stretch"):
+        with st.spinner("Looking for growing companies below their analyst targets..."):
+            try:
+                st.session_state["raw_Position"] = scan_position(p)
+                st.session_state["session_Position"] = session
+            except Exception as e:
+                st.session_state.pop("raw_Position", None)
+                st.error(f"Scan failed: {type(e).__name__}: {e}")
+    if "raw_Position" not in st.session_state:
+        st.markdown(stats_html([("👆", "Press scan to start", ""),
+                                ("🎯", f"{p['pos_upside']:g}%+ upside", ""),
+                                ("🏦", f"{rating_label(p['pos_rating'])} or better", ""),
+                                ("🛑", f"{p['pos_stop_pct']:g}% stop", "")]), unsafe_allow_html=True)
+        return []
+    raw = st.session_state["raw_Position"].copy()
+    sess = st.session_state["session_Position"]
+    if raw.empty:
+        st.success("😌 No analyst-covered stock is trading below its target. Nothing to buy.")
+        return []
+    # rank on the fundamentals first (no news yet), then fetch news only for the cards shown
+    pre = []
+    for i, r in raw.iterrows():
+        plan = position_plan(ref_price(r, sess), float(r["price_target_average"]), p)
+        pre.append((i, sum(not ok for _, _, ok in position_checks(r, plan, [], p)), plan["target_pct"]))
+    pre = pd.DataFrame(pre, columns=["i", "fails", "up"]).set_index("i")
+    n_up = int((pre["up"] >= p["pos_upside"]).sum())
+    top = pre.sort_values(["fails", "up"], ascending=[True, False]).head(16).index
+    evs = [evaluate_position(raw.loc[i], p, sess) for i in top]
+    good = [e for e in evs if not e["failed"]]
+    skip = [e for e in evs if e["failed"]]
+    med = f"{pd.Series([e['plan']['target_pct'] for e in good]).median():+.0f}%" if good else "n/a"
+    st.markdown(stats_html([
+        (len(raw), "🏦 Below analyst target", f"Covered by at least {p['pos_analysts']} analysts and below their average target."),
+        (n_up, f"🎯 {p['pos_upside']:g}%+ upside", "Of those, how many trade at least that far below the target."),
+        (len(good), "Worth a look", "Passed every fundamental check. Still read the story before deciding."),
+        (med, "📈 Median upside", "Median distance to the analyst target among the names worth a look."),
+    ]), unsafe_allow_html=True)
+    if good:
+        st.markdown('<div class="sw sw-section">Worth a look</div>', unsafe_allow_html=True)
+        cols = st.columns(2, gap="medium")
+        for i, e in enumerate(good):
+            with cols[i % 2]:
+                render_candidate(e, p, sess, "Position")
+    if skip:
+        with st.expander(f"⛔ Skipped ({len(skip)}): they failed a check"):
+            cols = st.columns(2, gap="medium")
+            for i, e in enumerate(skip):
+                with cols[i % 2]:
+                    render_candidate(e, p, sess, "Position")
     return [(str(e["row"]["name"]), float(e["row"]["change"])) for e in good]
 
 
