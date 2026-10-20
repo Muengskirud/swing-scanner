@@ -493,7 +493,7 @@ header[data-testid="stHeader"] { background: transparent; }
 @keyframes swblink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
 .sw-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 6px 0 22px; }
-.sw-stat { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; }
+.sw-stat { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; min-height: 86px; box-sizing: border-box; }
 .sw-stat .n { font-size: 1.7rem; font-weight: 800; color: var(--text); line-height: 1.1; }
 .sw-stat .l { font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
 
@@ -618,6 +618,16 @@ div[data-testid="stElementContainer"]:has(iframe[height="0"]) { display: none; }
 .sw-lev b { color: var(--text); }
 .sw-lev a { color: var(--violet) !important; text-decoration: none; font-weight: 800; }
 .sw-lev span { flex-basis: 100%; }
+.st-key-upside_btn button { height: 100%; min-height: 86px; justify-content: flex-start; text-align: left;
+  background: var(--panel) !important; border: 1px solid rgba(139,108,255,.55) !important; border-radius: 16px !important;
+  padding: 14px 16px !important; transition: border-color .15s, transform .15s; }
+.st-key-upside_btn button:hover { border-color: var(--violet) !important; transform: translateY(-2px); }
+.st-key-upside_btn button p { font-size: .75rem !important; font-weight: 600 !important; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .6px; text-align: left; line-height: 1.4;
+  white-space: normal !important; overflow: visible !important; text-overflow: clip !important; }
+.st-key-upside_btn button div { overflow: visible !important; white-space: normal !important; }
+.st-key-upside_btn button p strong { display: block; font-size: 1.7rem; font-weight: 800; color: var(--text);
+  letter-spacing: 0; line-height: 1.1; }
 .sw-tkr a { color: var(--text) !important; text-decoration: none; }
 .sw-tkr a:hover { color: var(--violet) !important; }
 .sw-tkr a span { font-size: .8rem; color: var(--muted); margin-left: 4px; }
@@ -1176,6 +1186,42 @@ def results(p: dict, session: str) -> list:
     return [(str(e["row"]["name"]), float(e["row"]["change"])) for e in good]
 
 
+@st.dialog("🎯 Everything below its analyst target", width="large")
+def upside_dialog(raw: pd.DataFrame, pre: pd.DataFrame, p: dict, sess: str):
+    """Full list behind the upside stat: every scanned stock with at least the minimum upside."""
+    up = pre[pre["up"] >= p["pos_upside"]]
+    rows = raw.loc[up.index]
+    num = lambda r, f: bar(r, f, 0)  # noqa: E731
+    table = pd.DataFrame([{
+        "Ticker": r["name"], "Company": r["description"], "Sector": r["sector"],
+        "Price": ref_price(r, sess), "Target": num(r, "price_target_average"), "Upside %": up.loc[i, "up"],
+        "Analysts": rating_label(num(r, "recommendation_mark")), "# analysts": num(r, "recommendation_total"),
+        "Revenue growth %": num(r, "total_revenue_yoy_growth_ttm"), "PEG": num(r, "price_earnings_growth_ttm"),
+        "FCF margin %": num(r, "free_cash_flow_margin_ttm"),
+        "Below 52w high %": (100 * (1 - ref_price(r, sess) / num(r, "price_52_week_high"))
+                             if num(r, "price_52_week_high") else None),
+        "Checks": "✅ all pass" if up.loc[i, "fails"] == 0 else f"⛔ {int(up.loc[i, 'fails'])} failed",
+    } for i, r in rows.iterrows()]).sort_values("Upside %", ascending=False)
+    st.caption(f"{len(table)} stocks at least {p['pos_upside']:g}% below the analysts' average target. "
+               "Checks here skip the news check, which only runs for the cards. Huge upside often means the "
+               "stock crashed and analysts haven't cut their targets yet, so compare with 'Below 52w high'.")
+    st.dataframe(table, hide_index=True, height=560, width="stretch", column_config={
+        "Price": st.column_config.NumberColumn(format="$%.2f"),
+        "Target": st.column_config.NumberColumn(format="$%.2f"),
+        "Upside %": st.column_config.NumberColumn(format="%+.0f%%"),
+        "# analysts": st.column_config.NumberColumn(format="%d"),
+        "Revenue growth %": st.column_config.NumberColumn(format="%+.0f%%"),
+        "PEG": st.column_config.NumberColumn(format="%.2f"),
+        "FCF margin %": st.column_config.NumberColumn(format="%.0f%%"),
+        "Below 52w high %": st.column_config.NumberColumn(format="%.0f%%"),
+    })
+
+
+def stat_html(n, label: str, tip: str = "") -> str:
+    return (f'<div class="sw sw-stat"' + (f' data-tip="{html.escape(tip)}"' if tip else "") +
+            f'><div class="n">{n}</div><div class="l">{label}</div></div>')
+
+
 def results_position(p: dict, session: str) -> list:
     """Position mode: scan button, stats and value cards."""
     c1, c2 = st.columns([2, 1])
@@ -1211,12 +1257,19 @@ def results_position(p: dict, session: str) -> list:
     good = [e for e in evs if not e["failed"]]
     skip = [e for e in evs if e["failed"]]
     med = f"{pd.Series([e['plan']['target_pct'] for e in good]).median():+.0f}%" if good else "n/a"
-    st.markdown(stats_html([
-        (len(raw), "🏦 Below analyst target", f"Covered by at least {p['pos_analysts']} analysts and below their average target."),
-        (n_up, f"🎯 {p['pos_upside']:g}%+ upside", "Of those, how many trade at least that far below the target."),
-        (len(good), "Worth a look", "Passed every fundamental check. Still read the story before deciding."),
-        (med, "📈 Median upside", "Median distance to the analyst target among the names worth a look."),
-    ]), unsafe_allow_html=True)
+    c = st.columns(4, gap="small")
+    c[0].markdown(stat_html(len(raw), "🏦 Below analyst target",
+                            f"Covered by at least {p['pos_analysts']} analysts and below their average target."),
+                  unsafe_allow_html=True)
+    if c[1].button(f"**{n_up}** 🎯 {p['pos_upside']:g}%+ upside ↗", key="upside_btn", width="stretch",
+                   help=None):
+        upside_dialog(raw, pre, p, sess)
+    c[2].markdown(stat_html(len(good), "Worth a look",
+                            "Passed every fundamental check. Still read the story before deciding."),
+                  unsafe_allow_html=True)
+    c[3].markdown(stat_html(med, "📈 Median upside",
+                            "Median distance to the analyst target among the names worth a look."),
+                  unsafe_allow_html=True)
     if good:
         st.markdown('<div class="sw sw-section">Worth a look</div>', unsafe_allow_html=True)
         cols = st.columns(2, gap="medium")
