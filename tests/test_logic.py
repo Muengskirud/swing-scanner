@@ -192,7 +192,8 @@ def test_position_plan():
     assert plan["stop"] == 85.0 and plan["target"] == 160.0
     assert plan["target_pct"] == 60.0
     assert plan["rr"] == pytest.approx(4.0)
-    assert plan["shares"] == 2  # floor(35 / 15)
+    assert plan["shares"] == 13  # floor(200 / 15): position trades use their own $200 max loss
+    assert plan["risk"] == 195.0
 
 
 def test_rating_label():
@@ -237,3 +238,10 @@ def test_leveraged_plan_doubles_distances_and_halves_dollars():
 def test_leveraged_map_has_the_users_etfs():
     assert "MULL" in s.LEVERAGED_2X["MU"] and "SNXX" in s.LEVERAGED_2X["SNDK"]
     assert all(e.isupper() and 3 <= len(e) <= 5 for v in s.LEVERAGED_2X.values() for e in v)
+
+
+def test_each_mode_has_its_own_max_loss():
+    assert s.DEFAULTS["max_risk"] == 35 and s.DEFAULTS["pos_max_risk"] == 200
+    swing = s.build_plan(100.0, 4.0, P)
+    assert swing["risk"] <= 35  # swing sizing ignores the position max loss
+    assert s.DEFAULTS["pos_peg"] == 1.0

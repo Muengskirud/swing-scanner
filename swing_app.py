@@ -74,8 +74,8 @@ POS_COLUMNS = [
 DEFAULTS = {
     "mode": "Swing", "layman": False, "max_risk": 35, "rr": 3.0, "atr_mult": 1.5, "max_hold": 25,
     # position mode
-    "pos_upside": 20, "pos_rating": 2.0, "pos_analysts": 5, "pos_rev_growth": 10.0, "pos_peg": 1.5,
-    "pos_stop_pct": 15.0,
+    "pos_upside": 20, "pos_rating": 2.0, "pos_analysts": 5, "pos_rev_growth": 10.0, "pos_peg": 1.0,
+    "pos_stop_pct": 15.0, "pos_max_risk": 200,
     "min_mcap_b": 2.0, "min_price": 5.0, "min_avg_vol": 1_000_000, "rsi_min": 20, "rsi_max": 35,
     "min_rel_vol": 1.5, "bb_tol": 1.01, "earn_buffer": 7,
 }
@@ -359,7 +359,7 @@ def position_plan(entry: float, target: float, p: dict) -> dict:
     Shares = max loss / (entry - stop)."""
     stop = entry * (1 - p["pos_stop_pct"] / 100)
     dist = entry - stop
-    shares = math.floor(p["max_risk"] / dist) if dist > 0 else 0
+    shares = math.floor(p["pos_max_risk"] / dist) if dist > 0 else 0
     return {
         "entry": round(entry, 2), "stop": round(stop, 2), "target": round(target, 2),
         "rr": reward_risk(entry, stop, target),
@@ -394,7 +394,7 @@ def position_checks(row, plan, news, p) -> list:
          fcf is not None and fcf > 0),
         ("No severe red-flag headline", "severe red-flag headline", "severe" not in levels),
         ("At least 1 share fits your max loss",
-         f"stop is wider than your ${p['max_risk']:g} max loss", plan["shares"] >= 1),
+         f"stop is wider than your ${p['pos_max_risk']:g} max loss", plan["shares"] >= 1),
     ]
 
 
@@ -712,11 +712,12 @@ def sidebar() -> dict:
                                 default="🏔️ Position" if s["mode"] == "Position" else "⚡ Swing",
                                 label_visibility="collapsed", width="stretch")
     p["mode"] = "Position" if pick and "Position" in pick else "Swing"
-    p["max_risk"] = field(sb, "number_input", 
-        "💸 Max loss per trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0,
-        help="The most you're willing to lose if the stop is hit. The app works out how many shares "
-             "to buy so that hitting the stop costs about this much. Shares = max loss ÷ (entry − stop).")
+    loss_help = ("The most you're willing to lose if the stop is hit. The app works out how many shares "
+                 "to buy so that hitting the stop costs about this much. Shares = max loss ÷ (entry − stop). "
+                 "Swing and position trades each keep their own amount.")
     if p["mode"] == "Swing":
+        p["max_risk"] = field(sb, "number_input", 
+            "💸 Max loss per swing trade (USD)", 1.0, 100_000.0, float(s["max_risk"]), 5.0, help=loss_help)
         p["rr"] = field(sb, "number_input", 
             "🎯 Reward : risk target (1 : x)", MIN_RR, MAX_RR, float(s["rr"]), 0.5,
             help="Target = entry + this many times the stop distance. 1:3 means risk $35 to aim for "
@@ -759,6 +760,9 @@ def sidebar() -> dict:
                 help="Skips stocks reporting earnings within this many days. Earnings can make a stock "
                      "jump past your stop overnight.")
     else:
+        p["pos_max_risk"] = field(sb, "number_input", 
+            "💸 Max loss per position trade (USD)", 1.0, 100_000.0, float(s["pos_max_risk"]), 10.0,
+            help=loss_help)
         p["pos_stop_pct"] = field(sb, "number_input", 
             "🛑 Stop loss (% below entry)", 3.0, 50.0, float(s["pos_stop_pct"]), 1.0,
             help="Position trades are held for months, so the stop sits further away than a swing stop. "
